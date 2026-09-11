@@ -1,0 +1,11 @@
+{
+  "run_id": "local-smoke",
+  "model_name": "tiny-placeholder",
+  "dataset": "toy-instructions",
+  "epochs": 1,
+  "learning_rate": 0.0002,
+  "status": "completed",
+  "started_from_config": "/Users/openclaw/sparky-mlops/ml-training/configs/local.yaml",
+  "completed_at": "2026-08-28T06:35:17.970409+00:00",
+  "artifact_dir": "runs/local-smoke"
+}

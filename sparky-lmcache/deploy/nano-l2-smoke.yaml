@@ -1,0 +1,289 @@
+# Smoke test: can a peer read another node's L2 (disk), or only its L1?
+#
+# Not a benchmark arm. Nano rather than Super because the question is about
+# LMCache's storage topology, which is model-independent, and Nano runs 3.5x
+# faster. Small everything, so it deploys in about two minutes.
+#
+# **The question.** findings.md records cross-node KV as "P2P between MP
+# servers, served from L1". If that is right, adding a disk tier buys Super
+# local capacity and nothing shareable -- it would help a router-only arm
+# exactly as much as a P2P arm, and the disk tier is not part of the article's
+# story. If it is wrong, a disk-backed L2 is shareable and Super has an
+# unexplored configuration worth a real arm.
+#
+# **What makes it conclusive.** --l2-store-policy skip_l1 deletes each key from
+# L1 after it is stored to L2. Combined with `lmcache kvcache clear`, which
+# empties L1 and leaves disk untouched, a subsequent hit cannot have come from
+# anywhere but disk. Without skip_l1 the chunks live in both tiers and any
+# result is ambiguous.
+#
+# **Why round_robin.** The KV router sends a repeat prompt back to the node
+# that already holds its prefix, which is precisely the behaviour that would
+# defeat this test. DYN_ROUTER_MODE=round_robin forces the second request onto
+# the other node.
+#
+#   COORD_L2_EVENTS=0   control arm
+#   COORD_L2_EVENTS=1   with --coordinator-l2-event-reporting, the only
+#                       documented mechanism for fleet-wide L2 discovery
+#
+# Run both. The flag is the variable.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: l2-smoke-worker-entrypoint
+  namespace: dynamo-system
+data:
+  start.sh: |
+    #!/usr/bin/env bash
+    # Do not remove the shebang. Without it execve returns ENOEXEC and the
+    # worker dies in under a second with no log, looking exactly like an OOM.
+    set -Eeuo pipefail
+    ulimit -l unlimited
+    : "${NODE_IP:?downward API did not provide status.hostIP}"
+
+    mkdir -p "${L2_PATH}/lookups"
+
+    EXTRA=()
+    if [ "${COORD_L2_EVENTS:-0}" = 1 ]; then
+      EXTRA+=(--coordinator-l2-event-reporting)
+      echo "L2 smoke on ${NODE_IP}: coordinator L2 event reporting ON"
+    else
+      echo "L2 smoke on ${NODE_IP}: coordinator L2 event reporting OFF"
+    fi
+
+    lmcache server \
+      --host 0.0.0.0 --port 5555 \
+      --http-port 9500 \
+      --l1-size-gb "${L1_SIZE_GB}" \
+      --chunk-size "${CHUNK_SIZE}" \
+      --eviction-policy LRU \
+      --l2-store-policy "${L2_STORE_POLICY:-skip_l1}" \
+      --l2-adapter "{\"type\":\"fs\",\"base_path\":\"${L2_PATH}\",\"use_odirect\":true}" \
+      --enable-extra-logging \
+      --extra-logging-interval 5 \
+      --lookup-hash-log-dir "${L2_PATH}/lookups" \
+      --p2p-advertise-url "${NODE_IP}:${P2P_PORT}" \
+      --p2p-transfer-engine nixl \
+      --coordinator-url "${COORDINATOR_URL}" \
+      --coordinator-advertise-ip "${NODE_IP}" \
+      --instance-id "spark-${NODE_IP##*.}" \
+      "${EXTRA[@]}" &
+
+    for i in $(seq 60); do
+      (echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null && break
+      sleep 2
+    done
+    (echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null || {
+      echo "LMCACHE_START_FAIL: server never listened on 5555"; exit 41; }
+    exec python3 -m dynamo.vllm "$@"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lmcache-coordinator
+  namespace: dynamo-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: lmcache-coordinator }
+  template:
+    metadata:
+      labels: { app: lmcache-coordinator }
+    spec:
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/hostname: spark-a
+      containers:
+        - name: coordinator
+          image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+          imagePullPolicy: IfNotPresent
+          command: ["lmcache"]
+          args:
+            - coordinator
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "9300"
+            # Must equal the servers' CHUNK_SIZE or peers agree on nothing.
+            # Default is 256 and it starts happily with the wrong value.
+            - --chunk-size
+            - "2128"
+          ports:
+            - { name: http, containerPort: 9300 }
+          readinessProbe:
+            tcpSocket: { port: 9300 }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nano-l2-smoke-frontend-ext
+  namespace: dynamo-system
+spec:
+  type: NodePort
+  selector:
+    nvidia.com/selector: nano-l2-smoke-frontend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      # 30800 nano-p2p, 30801 nano-router, 30802 super-router, 30803 super-p2p.
+      nodePort: 30804
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: nano-l2-smoke
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  components:
+    - name: Frontend
+      type: frontend
+      replicas: 1
+      podTemplate:
+        spec:
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["python3"]
+              args:
+                - -m
+                - dynamo.frontend
+              env:
+                # **Not kv.** The KV router would send the repeat prompt back
+                # to the node that already holds the prefix, which is the one
+                # thing that makes this test unable to fail.
+                - name: DYN_ROUTER_MODE
+                  value: round_robin
+              ports:
+                - { name: http, containerPort: 8000 }
+              startupProbe:
+                httpGet: { path: /health, port: 8000 }
+                periodSeconds: 10
+                failureThreshold: 60
+
+    - name: VllmDecodeWorker
+      type: worker
+      replicas: 2
+      podTemplate:
+        spec:
+          hostNetwork: true
+          hostIPC: true
+          dnsPolicy: ClusterFirstWithHostNet
+          volumes:
+            - name: hf-cache
+              hostPath: { path: /home/user/hf-cache, type: Directory }
+            - name: entrypoint
+              configMap:
+                name: l2-smoke-worker-entrypoint
+                defaultMode: 0755
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 24Gi }
+            # Plain directory, not the loopback image. A smoke test writes a
+            # few GB; the size cap only matters for a real arm, where nothing
+            # bounds L2 growth and a full root filesystem takes k3s with it.
+            - name: l2disk
+              hostPath: { path: /mnt/lmcache-l2, type: DirectoryOrCreate }
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["/entrypoint/start.sh"]
+              args:
+                - --model
+                - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+                - --served-model-name
+                - nemotron
+                - --trust-remote-code
+                - --load-format
+                - fastsafetensors
+                - --moe-backend
+                - cutlass
+                - --kv-cache-dtype
+                - fp8
+                - --mamba-ssm-cache-dtype
+                - bfloat16
+                - --mamba-cache-mode
+                - align
+                - --enable-chunked-prefill
+                - --enable-prefix-caching
+                - --dyn-reasoning-parser
+                - nemotron_v3
+                - --dyn-tool-call-parser
+                - nemotron_nano
+                - --max-model-len
+                - "131072"
+                - --max-num-seqs
+                - "32"
+                - --max-num-batched-tokens
+                - "4255"
+                # Deliberately modest. This is not measuring capacity.
+                - --kv-cache-memory-bytes
+                - "10000000000"
+                - --gpu-memory-utilization
+                - "0.55"
+                - --kv-transfer-config
+                - '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}'
+              env:
+                - name: NODE_IP
+                  valueFrom:
+                    fieldRef: { fieldPath: status.hostIP }
+                - name: COORDINATOR_URL
+                  value: http://10.1.0.11:9300
+                - name: CHUNK_SIZE
+                  value: "2128"
+                # 4 GB, so L1 is small enough that it is obviously not the
+                # source of any hit after `lmcache kvcache clear`.
+                - name: L1_SIZE_GB
+                  value: "4"
+                # Deletes each key from L1 after storing to L2. This is what
+                # makes a later hit provably come from disk.
+                - name: L2_STORE_POLICY
+                  value: "skip_l1"
+                - name: L2_PATH
+                  value: /l2disk
+                # The variable. Flip to "1" for the second run.
+                - name: COORD_L2_EVENTS
+                  value: "0"
+                - name: P2P_PORT
+                  value: "9450"
+                - name: UCX_NET_DEVICES
+                  value: rocep1s0f1:1,roceP2p1s0f1:1
+                - name: UCX_MAX_RNDV_RAILS
+                  value: "2"
+                - name: UCX_CM_USE_ALL_DEVICES
+                  value: "y"
+                - name: HF_HOME
+                  value: /hf-cache
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: VLLM_OMNI_USE_QUACK_FP8
+                  value: "0"
+                - name: PYTHONHASHSEED
+                  value: "42"
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK, SYS_RESOURCE]
+                runAsUser: 0
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                requests:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                  memory: 24Gi
+              volumeMounts:
+                - { name: hf-cache, mountPath: /hf-cache }
+                - { name: entrypoint, mountPath: /entrypoint }
+                - { name: dshm, mountPath: /dev/shm }
+                - { name: l2disk, mountPath: /l2disk }
+              startupProbe:
+                httpGet: { path: /live, port: 9090 }
+                periodSeconds: 30
+                failureThreshold: 40

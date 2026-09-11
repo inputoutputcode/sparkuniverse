@@ -1,0 +1,31 @@
+- name: Ensure compute nodes have shared storage mounted
+  hosts: slurm_compute
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Ensure NFS client package is installed
+      ansible.builtin.apt:
+        name: nfs-common
+        state: present
+        update_cache: false
+
+    - name: Ensure shared mount point exists
+      ansible.builtin.file:
+        path: /srv/sparky-mlops
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Mount shared Sparky MLOps storage
+      ansible.builtin.mount:
+        path: /srv/sparky-mlops
+        src: 192.168.1.82:/srv/sparky-mlops
+        fstype: nfs
+        opts: defaults,_netdev,vers=4
+        state: mounted
+
+    - name: Verify NFS mount exists
+      ansible.builtin.command: findmnt /srv/sparky-mlops
+      changed_when: false

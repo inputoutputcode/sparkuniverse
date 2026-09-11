@@ -1,0 +1,236 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: super-lmcache-worker-entrypoint
+  namespace: dynamo-system
+data:
+  start.sh: "#!/usr/bin/env bash\n# Do not remove. Without it execve returns ENOEXEC\
+    \ and the worker dies in\n# under a second with no log, which reads exactly like\
+    \ an OOM and is not.\nset -Eeuo pipefail\nulimit -l unlimited\n: \"${NODE_IP:?downward\
+    \ API did not provide status.hostIP}\"\nP2P_ARGS=()\nif [ \"${P2P_ENABLED:-1}\"\
+    \ = 1 ]; then\n  : \"${COORDINATOR_URL:?P2P_ENABLED=1 requires COORDINATOR_URL}\"\
+    \n  : \"${P2P_PORT:?P2P_ENABLED=1 requires P2P_PORT}\"\n  P2P_ARGS=(--p2p-advertise-url\
+    \ \"${NODE_IP}:${P2P_PORT}\"\n            --p2p-transfer-engine nixl\n       \
+    \     --coordinator-url \"${COORDINATOR_URL}\"\n            --coordinator-advertise-ip\
+    \ \"${NODE_IP}\")\n  echo \"worker on ${NODE_IP}, P2P on, coordinator ${COORDINATOR_URL}\"\
+    \nelse\n  echo \"worker on ${NODE_IP}, P2P OFF, L1 only\"\nfi\nlmcache server\
+    \ \\\n  --host 0.0.0.0 --port 5555 \\\n  --http-port 9500 \\\n  --l1-size-gb \"\
+    ${L1_SIZE_GB}\" \\\n  --chunk-size \"${CHUNK_SIZE}\" \\\n  --eviction-policy LRU\
+    \ \\\n  --eviction-trigger-watermark \"${EVICTION_WATERMARK:-0.8}\" \\\n  --eviction-ratio\
+    \ \"${EVICTION_RATIO:-0.2}\" \\\n  --l2-prefetch-policy \"${L2_PREFETCH_POLICY:-default}\"\
+    \ \\\n  --instance-id \"spark-${NODE_IP##*.}\" \\\n  \"${P2P_ARGS[@]}\" &\nfor\
+    \ i in $(seq 60); do\n  (echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null && break\n\
+    \  sleep 2\ndone\n(echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null || {\n  echo \"\
+    LMCACHE_START_FAIL: server never listened on 5555\"; exit 41; }\nexec python3\
+    \ -m dynamo.vllm \"$@\"\n"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lmcache-coordinator
+  namespace: dynamo-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lmcache-coordinator
+  template:
+    metadata:
+      labels:
+        app: lmcache-coordinator
+    spec:
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/hostname: spark-a
+      containers:
+      - name: coordinator
+        image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+        imagePullPolicy: IfNotPresent
+        command:
+        - lmcache
+        args:
+        - coordinator
+        - --host
+        - 0.0.0.0
+        - --port
+        - '9300'
+        - --chunk-size
+        - '4224'
+        ports:
+        - name: http
+          containerPort: 9300
+        readinessProbe:
+          tcpSocket:
+            port: 9300
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: super-agg-p2p-frontend-ext
+  namespace: dynamo-system
+spec:
+  type: NodePort
+  selector:
+    nvidia.com/selector: super-agg-p2p-frontend
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+    nodePort: 30803
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: super-agg-p2p
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  components:
+  - name: Frontend
+    type: frontend
+    replicas: 1
+    podTemplate:
+      spec:
+        containers:
+        - name: main
+          image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+          imagePullPolicy: IfNotPresent
+          command:
+          - python3
+          args:
+          - -m
+          - dynamo.frontend
+          env:
+          - name: DYN_ROUTER_MODE
+            value: kv
+          - name: DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY
+            value: '0.0'
+          ports:
+          - name: http
+            containerPort: 8000
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 60
+  - name: VllmDecodeWorker
+    type: worker
+    replicas: 2
+    podTemplate:
+      spec:
+        hostNetwork: true
+        hostIPC: true
+        dnsPolicy: ClusterFirstWithHostNet
+        volumes:
+        - name: hf-cache
+          hostPath:
+            path: /home/user/hf-cache
+            type: Directory
+        - name: entrypoint
+          configMap:
+            name: super-lmcache-worker-entrypoint
+            defaultMode: 493
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 24Gi
+        containers:
+        - name: main
+          image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+          imagePullPolicy: IfNotPresent
+          command:
+          - /entrypoint/start.sh
+          args:
+          - --model
+          - nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+          - --served-model-name
+          - nemotron
+          - --trust-remote-code
+          - --load-format
+          - fastsafetensors
+          - --moe-backend
+          - cutlass
+          - --kv-cache-dtype
+          - fp8
+          - --mamba-ssm-cache-dtype
+          - bfloat16
+          - --mamba-cache-mode
+          - align
+          - --enable-chunked-prefill
+          - --enable-prefix-caching
+          - --dyn-reasoning-parser
+          - nemotron_v3
+          - --dyn-tool-call-parser
+          - nemotron_nano
+          - --max-model-len
+          - '131072'
+          - --max-num-seqs
+          - '32'
+          - --max-num-batched-tokens
+          - '8447'
+          - --kv-cache-memory-bytes
+          - '10000000000'
+          - --gpu-memory-utilization
+          - '0.82'
+          - --kv-transfer-config
+          - '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}'
+          env:
+          - name: NODE_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+          - name: COORDINATOR_URL
+            value: http://10.1.0.11:9300
+          - name: CHUNK_SIZE
+            value: '4224'
+          - name: L1_SIZE_GB
+            value: '10'
+          - name: P2P_ENABLED
+            value: '1'
+          - name: L2_PREFETCH_POLICY
+            value: default
+          - name: EVICTION_RATIO
+            value: '0.05'
+          - name: EVICTION_WATERMARK
+            value: '0.95'
+          - name: P2P_PORT
+            value: '9450'
+          - name: UCX_NET_DEVICES
+            value: rocep1s0f1:1
+          - name: HF_HOME
+            value: /hf-cache
+          - name: HF_HUB_OFFLINE
+            value: '1'
+          - name: VLLM_OMNI_USE_QUACK_FP8
+            value: '0'
+          - name: PYTHONHASHSEED
+            value: '42'
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+              - SYS_RESOURCE
+            runAsUser: 0
+          resources:
+            limits:
+              nvidia.com/gpu: '1'
+              rdma/rdma_shared_device_a: '1'
+            requests:
+              nvidia.com/gpu: '1'
+              rdma/rdma_shared_device_a: '1'
+              memory: 24Gi
+          volumeMounts:
+          - name: hf-cache
+            mountPath: /hf-cache
+          - name: entrypoint
+            mountPath: /entrypoint
+          - name: dshm
+            mountPath: /dev/shm
+          startupProbe:
+            httpGet:
+              path: /live
+              port: 9090
+            periodSeconds: 30
+            failureThreshold: 80

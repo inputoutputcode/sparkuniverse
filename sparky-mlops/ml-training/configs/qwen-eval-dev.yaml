@@ -1,0 +1,22 @@
+base_model: Qwen/Qwen2.5-0.5B-Instruct
+adapter_subdir: qwen-lora-adapter
+
+machine_eval_path: ml-training/evals/machine-scored-dev.jsonl
+human_eval_path: ml-training/evals/dolly-human-review-dev.jsonl
+
+max_new_tokens: 192
+temperature: 0.0
+top_p: 1.0
+do_sample: false
+
+quality_gates:
+  min_machine_accuracy: 0.80
+  max_empty_outputs: 0
+  max_adapter_avg_latency_seconds: 30.0
+  max_accuracy_regression_vs_base: 0.03
+
+output_files:
+  machine_results_jsonl: qwen-machine-eval-results.jsonl
+  human_results_jsonl: qwen-human-review-results.jsonl
+  summary_json: qwen-eval-summary.json
+  review_markdown: qwen-eval-review.md

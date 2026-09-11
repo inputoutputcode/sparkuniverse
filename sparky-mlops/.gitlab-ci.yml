@@ -1,0 +1,1094 @@
+stages:
+  - init
+  - infra
+  - train
+  - evaluate
+  - review
+
+# init
+
+runner-smoke:
+  stage: init
+  tags: 
+    - agenthost
+  script:
+    - whoami
+    - echo "$HOME"
+    - hostname
+    - pwd
+    - uname -a
+    - git --version
+    - glab --version || true
+    - ssh -V
+    - |
+      ssh chris@192.168.1.82 '
+        hostname
+        uname -a
+        nvidia-smi
+        which python3
+        python3 --version
+        which sbatch || true
+        which srun || true
+        which sinfo || true
+      '
+
+sync-project-files:
+  stage: init
+  tags:
+    - agenthost
+  needs:
+  - runner-smoke
+  script:
+    - ssh chris@spark-38fc 'mkdir -p /srv/sparky-mlops/jobs /srv/sparky-mlops/runs'
+    - ssh chris@spark-38fc 'rm -rf /srv/sparky-mlops/jobs/ml-training /srv/sparky-mlops/jobs/cluster-validation'
+    - scp -r ml-training chris@spark-38fc:/srv/sparky-mlops/jobs/
+    - scp -r cluster-validation chris@spark-38fc:/srv/sparky-mlops/jobs/
+
+# infra
+
+ansible-smoke:
+  stage: infra
+  tags: 
+    - agenthost
+  script:
+    - ansible --version
+    - ansible -i infra/ansible/inventory/hosts.ini dgx -m ping
+    - ansible -i infra/ansible/inventory/hosts.ini dgx -m command -a "python3 --version"
+    - ansible -i infra/ansible/inventory/hosts.ini dgx -m command -a "nvidia-smi"
+    - ansible -i infra/ansible/inventory/hosts.ini dgx -m shell -a "which sbatch || true"
+
+setup-shared-storage:
+  stage: infra
+  tags:
+    - agenthost
+  when: manual
+  script:
+    - ansible-playbook -i infra/ansible/inventory/hosts.ini infra/ansible/playbooks/setup-shared-storage.yml
+
+dgx-prereq-check:
+  stage: infra
+  tags:
+    - agenthost
+  script:
+    - ansible-playbook -i infra/ansible/inventory/hosts.ini infra/ansible/playbooks/check-dgx.yml
+
+slurm-hello:
+  stage: infra
+  tags:
+    - agenthost
+  needs:
+    - sync-project-files
+  script:
+    - |
+      set -uo pipefail
+
+      echo "Remote hello.sbatch:"
+      ssh chris@spark-38fc 'nl -ba /srv/sparky-mlops/jobs/ml-training/slurm/hello.sbatch'
+
+      echo "Submitting hello job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc 'sbatch --wait --parsable /srv/sparky-mlops/jobs/ml-training/slurm/hello.sbatch')
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,NodeList%30" || true
+
+      echo "Job details:"
+      ssh chris@spark-38fc "scontrol show job ${JOB_ID}" || true
+
+      echo "Matching output files:"
+      ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print" || true
+
+      echo "Output content:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/*${JOB_ID}*.out" || true
+
+      exit "${RC}"
+
+setup-nccl-tests:
+  stage: infra
+  tags:
+    - agenthost
+  when: manual
+  script:
+    - ansible-playbook -i infra/ansible/inventory/hosts.ini infra/ansible/playbooks/setup-nccl-tests.yml
+
+nccl-collectives:
+  stage: infra
+  tags:
+    - agenthost
+  needs:
+    - sync-project-files
+    - setup-nccl-tests
+  when: manual
+  script:
+    - |
+      set -euxo pipefail
+
+      echo "Checking synced NCCL files:"
+      ssh chris@spark-38fc "find /srv/sparky-mlops/jobs/cluster-validation -maxdepth 4 -type f -print | sort || true"
+
+      echo "Checking nccl-tests binaries:"
+      ssh chris@spark-38fc "ls -la /srv/sparky-mlops/jobs/nccl-tests/build || true"
+
+      echo "Checking Slurm nodes:"
+      ssh chris@spark-38fc "sinfo -Nel"
+      ssh chris@spark-38fc "scontrol show node spark-38fc | grep -E 'NodeName=|Gres=|CfgTRES=|AllocTRES='"
+      ssh chris@spark-38fc "scontrol show node spark-1ac4 | grep -E 'NodeName=|Gres=|CfgTRES=|AllocTRES='"
+
+      echo "Submitting NCCL job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc 'sbatch --wait --parsable /srv/sparky-mlops/jobs/cluster-validation/slurm/nccl-collectives.sbatch')
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      echo "Matching Slurm output files:"
+      if [ -n "${JOB_ID}" ]; then
+        ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print" || true
+
+        OUT_FILE=$(ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print -quit")
+        echo "OUT_FILE=${OUT_FILE}"
+
+        if [ -n "${OUT_FILE}" ]; then
+          ssh chris@spark-38fc "cat '${OUT_FILE}'"
+        fi
+
+        echo "Accounting:"
+        ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%25,State%15,ExitCode%10,Elapsed,Timelimit,NodeList%30" || true
+      fi
+
+      exit "${RC}"
+
+warmup-hf-cache:
+  stage: infra
+  tags:
+    - agenthost
+  needs:
+    - sync-project-files
+  rules:
+    - when: manual
+  script:
+    - |
+      set -euo pipefail
+
+      ssh chris@spark-38fc '/srv/sparky-mlops/venv/bin/python - <<'"'"'PY'"'"'
+      from datasets import load_dataset
+      from transformers import AutoModelForCausalLM, AutoTokenizer
+
+      cache_dir = "/srv/sparky-mlops/hf-cache"
+      model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+      dataset_name = "databricks/databricks-dolly-15k"
+
+      print(f"warming model cache: {model_name}")
+      AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+      AutoModelForCausalLM.from_pretrained(
+          model_name,
+          cache_dir=cache_dir,
+          dtype="auto",
+      )
+
+      print(f"warming dataset cache: {dataset_name}")
+      load_dataset(dataset_name, split="train", cache_dir=cache_dir)
+
+      print("HF cache warmup complete")
+      PY'
+
+# train
+
+slurm-fake-train:
+  stage: train
+  tags:
+    - agenthost
+  needs:
+    - sync-project-files
+  script:
+    - |
+      set -euxo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-${CI_JOB_ID}"
+      echo "RUN_ID=${RUN_ID}"
+
+      echo "Submitting training job..."
+      set +e
+      SUBMIT_OUTPUT=$(ssh chris@spark-38fc "cd /srv/sparky-mlops/jobs && RUN_ID=${RUN_ID} sbatch --wait --parsable ml-training/slurm/train.sbatch")
+      SUBMIT_RC=$?
+      set -e
+
+      echo "SUBMIT_OUTPUT=${SUBMIT_OUTPUT}"
+      echo "SUBMIT_RC=${SUBMIT_RC}"
+
+      JOB_ID="${SUBMIT_OUTPUT}"
+      test -n "${JOB_ID}" || true
+
+      echo "Matching Slurm output files:"
+      ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print" || true
+
+      if [ -n "${JOB_ID}" ]; then
+        OUT_FILE=$(ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print -quit")
+        echo "OUT_FILE=${OUT_FILE}"
+        if [ -n "${OUT_FILE}" ]; then
+          ssh chris@spark-38fc "cat '${OUT_FILE}'"
+        fi
+      fi
+
+      exit "${SUBMIT_RC}"
+
+slurm-real-train:
+  stage: train
+  tags:
+    - agenthost
+  needs:
+    - sync-project-files
+    - slurm-fake-train
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}"
+      echo "RUN_ID=${RUN_ID}"
+
+      echo "Remote train-real.sbatch:"
+      ssh chris@spark-38fc 'nl -ba /srv/sparky-mlops/jobs/ml-training/slurm/train-real.sbatch'
+
+      echo "Submitting real training job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "cd /srv/sparky-mlops/jobs && RUN_ID=${RUN_ID} sbatch --wait --parsable ml-training/slurm/train-real.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,NodeList%30" || true
+
+      echo "Matching output files:"
+      ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print" || true
+
+      echo "Slurm output:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/*${JOB_ID}*.out" || true
+
+      echo "Training metadata:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/metadata.json" || true
+
+      echo "Training metrics:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/metrics.json" || true
+
+      exit "${RC}"
+
+slurm-distributed-smoke:
+  stage: train
+  tags:
+    - agenthost
+  needs:
+    - sync-project-files
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-dist-smoke"
+      echo "RUN_ID=${RUN_ID}"
+
+      echo "Remote distributed-smoke.sbatch:"
+      ssh chris@spark-38fc 'nl -ba /srv/sparky-mlops/jobs/ml-training/slurm/distributed-smoke.sbatch'
+
+      echo "Submitting distributed smoke job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "cd /srv/sparky-mlops/jobs && RUN_ID=${RUN_ID} sbatch --wait --parsable ml-training/slurm/distributed-smoke.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,NodeList%30" || true
+
+      echo "Matching output files:"
+      ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print" || true
+
+      echo "Slurm output:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/*${JOB_ID}*.out" || true
+
+      echo "Distributed smoke artifact:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/distributed-smoke.json" || true
+
+      exit "${RC}"
+
+slurm-ddp-train:
+  stage: train
+  tags:
+    - agenthost
+  needs:
+    - sync-project-files
+    - slurm-distributed-smoke
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-ddp"
+      echo "RUN_ID=${RUN_ID}"
+
+      echo "Remote train-ddp.sbatch:"
+      ssh chris@spark-38fc 'nl -ba /srv/sparky-mlops/jobs/ml-training/slurm/train-ddp.sbatch'
+
+      echo "Submitting DDP training job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "cd /srv/sparky-mlops/jobs && RUN_ID=${RUN_ID} sbatch --wait --parsable ml-training/slurm/train-ddp.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,NodeList%30" || true
+
+      echo "Matching output files:"
+      ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print" || true
+
+      echo "Slurm output:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/*${JOB_ID}*.out" || true
+
+      echo "DDP metadata:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/ddp-metadata.json" || true
+
+      echo "DDP metrics:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/ddp-metrics.json" || true
+
+      exit "${RC}"
+
+slurm-qwen-ddp-train:
+  stage: train
+  tags:
+    - agenthost
+  needs:
+    - sync-project-files
+    - slurm-ddp-train
+  rules:
+    - when: manual
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp"
+      echo "RUN_ID=${RUN_ID}"
+
+      echo "Remote train-qwen-ddp.sbatch:"
+      ssh chris@spark-38fc 'nl -ba /srv/sparky-mlops/jobs/ml-training/slurm/train-qwen-ddp.sbatch'
+
+      echo "Submitting Qwen DDP LoRA training job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "cd /srv/sparky-mlops/jobs && RUN_ID=${RUN_ID} sbatch --wait --parsable ml-training/slurm/train-qwen-ddp.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,NodeList%30" || true
+
+      echo "Slurm output:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/*${JOB_ID}*.out" || true
+
+      echo "Qwen DDP metadata:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-ddp-metadata.json" || true
+
+      echo "Qwen DDP metrics:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-ddp-metrics.json" || true
+
+      exit "${RC}"
+
+slurm-qwen-ddp-train-stability:
+  stage: train
+  tags:
+    - agenthost
+  when: manual
+  allow_failure: false
+  needs:
+    - sync-project-files
+    - slurm-ddp-train
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp-capacity"
+
+      echo "RUN_ID=${RUN_ID}"
+      echo "Remote train-qwen-ddp.sbatch:"
+      ssh chris@spark-38fc 'nl -ba /srv/sparky-mlops/jobs/ml-training/slurm/train-qwen-ddp.sbatch'
+
+      echo "Submitting Qwen DDP LoRA stability training job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "RUN_ID=${RUN_ID} CONFIG_PATH=ml-training/configs/qwen-ddp-capacity.yaml sbatch --wait --parsable /srv/sparky-mlops/jobs/ml-training/slurm/train-qwen-ddp.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      if [ -z "${JOB_ID}" ]; then
+        echo "ERROR: sbatch did not return a job id"
+        exit "${RC}"
+      fi
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,MaxRSS,NodeList%30 || true"
+
+      echo "Slurm output:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/qwen-ddp-${JOB_ID}-*.out || true"
+
+      echo "Training metadata:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-ddp-metadata.json || true"
+
+      echo "Training metrics:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-ddp-metrics.json || true"
+
+      exit "${RC}"
+
+slurm-qwen-ddp-train-format:
+  stage: train
+  tags:
+    - agenthost
+  when: manual
+  allow_failure: false
+  needs:
+    - job: sync-project-files
+  rules:
+    - when: manual
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp-format"
+
+      echo "RUN_ID=${RUN_ID}"
+
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "RUN_ID=${RUN_ID} CONFIG_PATH=ml-training/configs/qwen-ddp-format.yaml sbatch --wait --parsable /srv/sparky-mlops/jobs/ml-training/slurm/train-qwen-ddp.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      if [ -z "${JOB_ID}" ]; then
+        echo "ERROR: sbatch did not return a job id"
+        exit "${RC}"
+      fi
+
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,MaxRSS,NodeList%30 || true"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/qwen-ddp-${JOB_ID}-*.out || true"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-ddp-metadata.json || true"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-ddp-metrics.json || true"
+
+      exit "${RC}"
+
+slurm-qwen-ddp-train-format-balanced:
+  stage: train
+  tags:
+    - agenthost
+  when: manual
+  allow_failure: false
+  needs:
+    - job: sync-project-files
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp-format-balanced"
+
+      echo "RUN_ID=${RUN_ID}"
+
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "RUN_ID=${RUN_ID} CONFIG_PATH=ml-training/configs/qwen-ddp-format-balanced.yaml sbatch --wait --parsable /srv/sparky-mlops/jobs/ml-training/slurm/train-qwen-ddp.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      if [ -z "${JOB_ID}" ]; then
+        echo "ERROR: sbatch did not return a job id"
+        exit "${RC}"
+      fi
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,MaxRSS,NodeList%30 || true"
+
+      echo "Slurm output:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/qwen-ddp-${JOB_ID}-*.out || true"
+
+      echo "Training metadata:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-ddp-metadata.json || true"
+
+      echo "Training metrics:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-ddp-metrics.json || true"
+
+      exit "${RC}"
+
+# evaluate
+
+slurm-fake-train-evaluate:
+  stage: evaluate
+  when: on_success
+  allow_failure: false
+  tags:
+    - agenthost
+  needs:
+    - sync-project-files
+  script:
+    - |
+      set -euxo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-${CI_JOB_ID}"
+      echo "RUN_ID=${RUN_ID}"
+
+      TRAIN_JOB_ID=$(ssh chris@192.168.1.82 "cd /srv/sparky-mlops/jobs && RUN_ID=${RUN_ID} sbatch --wait --parsable ml-training/slurm/train.sbatch")
+      echo "Submitted Slurm training job ${TRAIN_JOB_ID} for run ${RUN_ID}"
+      test -n "${TRAIN_JOB_ID}"
+
+      echo "Training Slurm output:"
+      ssh chris@192.168.1.82 "cat /srv/sparky-mlops/runs/fake-train-${TRAIN_JOB_ID}-*.out"
+
+      echo "Training metadata:"
+      ssh chris@192.168.1.82 "cat /srv/sparky-mlops/runs/${RUN_ID}/metadata.json"
+
+      EVAL_JOB_ID=$(ssh chris@192.168.1.82 "cd /srv/sparky-mlops/jobs/ && RUN_ID=${RUN_ID} sbatch --wait --parsable ml-training/slurm/evaluate.sbatch")
+      echo "Submitted Slurm evaluation job ${EVAL_JOB_ID} for run ${RUN_ID}"
+      test -n "${EVAL_JOB_ID}"
+
+      echo "Evaluation Slurm output:"
+      ssh chris@192.168.1.82 "cat /srv/sparky-mlops/runs//fake-eval-${EVAL_JOB_ID}-*.out"
+
+      echo "Evaluation metrics:"
+      ssh chris@192.168.1.82 "cat /srv/sparky-mlops/runs//${RUN_ID}/metrics.json"
+
+slurm-real-evaluate:
+  stage: evaluate
+  tags:
+    - agenthost
+  needs:
+    - slurm-real-train
+    - slurm-fake-train-evaluate
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}"
+      echo "RUN_ID=${RUN_ID}"
+
+      echo "Remote evaluate-real.sbatch:"
+      ssh chris@spark-38fc 'nl -ba /srv/sparky-mlops/jobs/ml-training/slurm/evaluate-real.sbatch'
+
+      echo "Submitting real evaluation job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "cd /srv/sparky-mlops/jobs && RUN_ID=${RUN_ID} sbatch --wait --parsable ml-training/slurm/evaluate-real.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,NodeList%30" || true
+
+      echo "Matching output files:"
+      ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print" || true
+
+      echo "Slurm output:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/*${JOB_ID}*.out" || true
+
+      echo "Training metadata:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/metadata.json" || true
+
+      echo "Training metrics:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/metrics.json" || true
+
+      echo "Evaluation:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/evaluation.json" || true
+
+      exit "${RC}"
+
+collect-run-artifacts:
+  stage: evaluate
+  tags:
+    - agenthost
+  needs:
+    - slurm-real-evaluate
+  script:
+    - |
+      set -euo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}"
+      mkdir -p artifacts/${RUN_ID}
+
+      scp chris@spark-38fc:/srv/sparky-mlops/runs/${RUN_ID}/metadata.json artifacts/${RUN_ID}/
+      scp chris@spark-38fc:/srv/sparky-mlops/runs/${RUN_ID}/metrics.json artifacts/${RUN_ID}/
+      scp chris@spark-38fc:/srv/sparky-mlops/runs/${RUN_ID}/evaluation.json artifacts/${RUN_ID}/
+
+      echo "Collected artifacts:"
+      find artifacts -type f -maxdepth 3 -print
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/
+
+validate-real-evaluation:
+  stage: evaluate
+  tags:
+    - agenthost
+  needs:
+    - collect-run-artifacts
+  script:
+    - |
+      set -euo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}"
+      EVAL_PATH="artifacts/${RUN_ID}/evaluation.json"
+      METRICS_PATH="artifacts/${RUN_ID}/metrics.json"
+      METADATA_PATH="artifacts/${RUN_ID}/metadata.json"
+
+      python3 - <<PY
+      import json
+      import math
+      from pathlib import Path
+
+      eval_path = Path("${EVAL_PATH}")
+      metrics_path = Path("${METRICS_PATH}")
+      metadata_path = Path("${METADATA_PATH}")
+
+      for path in [eval_path, metrics_path, metadata_path]:
+          if not path.exists():
+              raise SystemExit(f"missing artifact: {path}")
+
+      evaluation = json.loads(eval_path.read_text())
+      metrics = json.loads(metrics_path.read_text())
+      metadata = json.loads(metadata_path.read_text())
+
+      required_eval = ["accuracy", "avg_eval_loss", "elapsed_seconds", "device"]
+      for key in required_eval:
+          if key not in evaluation:
+              raise SystemExit(f"evaluation missing key: {key}")
+
+      numeric_eval = ["accuracy", "avg_eval_loss", "elapsed_seconds"]
+      for key in numeric_eval:
+          value = evaluation[key]
+          if not isinstance(value, (int, float)) or not math.isfinite(value):
+              raise SystemExit(f"evaluation key is not finite numeric: {key}={value}")
+
+      if evaluation["device"] != "cuda":
+          raise SystemExit(f"evaluation did not run on cuda: {evaluation['device']}")
+
+      if not metadata.get("cuda_available"):
+          raise SystemExit("training metadata says cuda_available is false")
+
+      if "final_loss" not in metrics:
+          raise SystemExit("training metrics missing final_loss")
+
+      print("Evaluation validation passed")
+      print(json.dumps({
+          "run_id": evaluation.get("run_id"),
+          "accuracy": evaluation["accuracy"],
+          "avg_eval_loss": evaluation["avg_eval_loss"],
+          "training_final_loss": metrics["final_loss"],
+          "device": evaluation["device"],
+          "training_host": metadata.get("host"),
+          "evaluation_host": evaluation.get("host"),
+      }, indent=2))
+      PY
+
+build-dolly-eval-set:
+  stage: evaluate
+  tags:
+    - agenthost
+  needs:
+    - job: sync-project-files
+  script:
+    - |
+      set -uo pipefail
+
+      echo "Submitting Dolly held-out eval-set build job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "sbatch --wait --parsable /srv/sparky-mlops/jobs/ml-training/slurm/build-dolly-eval.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,MaxRSS,NodeList%30 || true"
+
+      echo "Slurm output:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/build-eval-${JOB_ID}-*.out || true"
+
+      echo "Eval set preview:"
+      ssh chris@spark-38fc "wc -l /srv/sparky-mlops/jobs/ml-training/evals/dolly-heldout-dev.jsonl"
+      ssh chris@spark-38fc "head -n 3 /srv/sparky-mlops/jobs/ml-training/evals/dolly-heldout-dev.jsonl"
+
+      exit "${RC}"
+
+slurm-qwen-evaluate:
+  stage: evaluate
+  tags:
+    - agenthost
+  needs:
+    - job: sync-project-files
+    - job: slurm-qwen-ddp-train
+    - job: build-dolly-eval-set
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp"
+
+      echo "RUN_ID=${RUN_ID}"
+      echo "Remote evaluate-qwen-lora.sbatch:"
+      ssh chris@spark-38fc 'nl -ba /srv/sparky-mlops/jobs/ml-training/slurm/evaluate-qwen-lora.sbatch'
+
+      echo "Submitting Qwen LoRA evaluation job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "RUN_ID=${RUN_ID} sbatch --wait --parsable /srv/sparky-mlops/jobs/ml-training/slurm/evaluate-qwen-lora.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      if [ -z "${JOB_ID}" ]; then
+        echo "ERROR: sbatch did not return a job id"
+        exit "${RC}"
+      fi
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,MaxRSS,NodeList%30 || true"
+
+      echo "Matching output files:"
+      ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print"
+
+      OUT_FILE=$(ssh chris@spark-38fc "find /srv/sparky-mlops/runs -maxdepth 1 -type f -name '*${JOB_ID}*.out' -print -quit")
+      echo "OUT_FILE=${OUT_FILE}"
+
+      if [ -n "${OUT_FILE}" ]; then
+        echo "Slurm output:"
+        ssh chris@spark-38fc "cat '${OUT_FILE}'"
+      fi
+
+      echo "Evaluation summary:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-summary.json || true"
+
+      echo "Human review:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-review.md || true"
+
+      exit "${RC}"
+
+slurm-qwen-evaluate-stability:
+  stage: evaluate
+  tags:
+    - agenthost
+  allow_failure: false
+  needs:
+    - job: sync-project-files
+    - job: build-dolly-eval-set
+    - job: slurm-qwen-ddp-train-stability
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp-capacity"
+
+      echo "RUN_ID=${RUN_ID}"
+
+      echo "Submitting Qwen LoRA stability evaluation job..."
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "RUN_ID=${RUN_ID} sbatch --wait --parsable /srv/sparky-mlops/jobs/ml-training/slurm/evaluate-qwen-lora.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      if [ -z "${JOB_ID}" ]; then
+        echo "ERROR: sbatch did not return a job id"
+        exit "${RC}"
+      fi
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,MaxRSS,NodeList%30 || true"
+
+      echo "Slurm output:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/qwen-eval-${JOB_ID}-*.out || true"
+
+      echo "Evaluation summary:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-summary.json || true"
+
+      echo "Human review:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-review.md || true"
+
+      exit "${RC}"
+
+slurm-qwen-evaluate-format:
+  stage: evaluate
+  tags:
+    - agenthost
+  allow_failure: false
+  needs:
+    - job: sync-project-files
+    - job: slurm-qwen-ddp-train-format
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp-format"
+
+      echo "RUN_ID=${RUN_ID}"
+
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "RUN_ID=${RUN_ID} sbatch --wait --parsable /srv/sparky-mlops/jobs/ml-training/slurm/evaluate-qwen-lora.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      if [ -z "${JOB_ID}" ]; then
+        echo "ERROR: sbatch did not return a job id"
+        exit "${RC}"
+      fi
+
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,MaxRSS,NodeList%30 || true"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/qwen-eval-${JOB_ID}-*.out || true"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-summary.json || true"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-review.md || true"
+
+      exit "${RC}"
+
+slurm-qwen-evaluate-format-balanced:
+  stage: evaluate
+  tags:
+    - agenthost
+  allow_failure: false
+  needs:
+    - job: sync-project-files
+    - job: slurm-qwen-ddp-train-format-balanced
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp-format-balanced"
+
+      echo "RUN_ID=${RUN_ID}"
+
+      set +e
+      JOB_ID=$(ssh chris@spark-38fc "RUN_ID=${RUN_ID} sbatch --wait --parsable /srv/sparky-mlops/jobs/ml-training/slurm/evaluate-qwen-lora.sbatch")
+      RC=$?
+      set -e
+
+      echo "JOB_ID=${JOB_ID}"
+      echo "RC=${RC}"
+
+      if [ -z "${JOB_ID}" ]; then
+        echo "ERROR: sbatch did not return a job id"
+        exit "${RC}"
+      fi
+
+      echo "Accounting:"
+      ssh chris@spark-38fc "sacct -j ${JOB_ID} --format=JobID%15,JobName%20,State%15,ExitCode%10,Elapsed,Timelimit,MaxRSS,NodeList%30 || true"
+
+      echo "Slurm output:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/qwen-eval-${JOB_ID}-*.out || true"
+
+      echo "Evaluation summary:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-summary.json || true"
+
+      echo "Human review:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-review.md || true"
+
+      exit "${RC}"
+
+# review
+
+build-pipeline-summary:
+  stage: review
+  tags:
+    - agenthost
+  needs:
+    - validate-real-evaluation
+    - slurm-ddp-train
+  script:
+    - |
+      set -euo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}"
+      DDP_RUN_ID="ci-${CI_PIPELINE_ID}-ddp"
+
+      mkdir -p artifacts
+
+      scp chris@spark-38fc:/srv/sparky-mlops/runs/${RUN_ID}/metadata.json artifacts/metadata.json
+      scp chris@spark-38fc:/srv/sparky-mlops/runs/${RUN_ID}/metrics.json artifacts/metrics.json
+      scp chris@spark-38fc:/srv/sparky-mlops/runs/${RUN_ID}/evaluation.json artifacts/evaluation.json
+      scp chris@spark-38fc:/srv/sparky-mlops/runs/${DDP_RUN_ID}/ddp-metadata.json artifacts/ddp-metadata.json
+      scp chris@spark-38fc:/srv/sparky-mlops/runs/${DDP_RUN_ID}/ddp-metrics.json artifacts/ddp-metrics.json
+
+      python3 - <<'PY'
+      import json
+      from pathlib import Path
+
+      root = Path("artifacts")
+
+      def read_json(name):
+          path = root / name
+          if not path.exists():
+              raise SystemExit(f"missing required artifact: {path}")
+          return json.loads(path.read_text())
+
+      metadata = read_json("metadata.json")
+      metrics = read_json("metrics.json")
+      evaluation = read_json("evaluation.json")
+      ddp_metadata = read_json("ddp-metadata.json")
+      ddp_metrics = read_json("ddp-metrics.json")
+
+      summary = {
+          "pipeline": {
+              "single_gpu_run_id": metadata.get("run_id"),
+              "ddp_run_id": ddp_metadata.get("run_id"),
+          },
+          "single_gpu_training": {
+              "host": metadata.get("host"),
+              "device": metrics.get("device"),
+              "cuda_available": metadata.get("cuda_available"),
+              "cuda_device_name": metadata.get("cuda_device_name"),
+              "final_loss": metrics.get("final_loss"),
+              "avg_loss": metrics.get("avg_loss"),
+              "elapsed_seconds": metrics.get("elapsed_seconds"),
+          },
+          "single_gpu_evaluation": {
+              "host": evaluation.get("host"),
+              "device": evaluation.get("device"),
+              "accuracy": evaluation.get("accuracy"),
+              "avg_eval_loss": evaluation.get("avg_eval_loss"),
+              "elapsed_seconds": evaluation.get("elapsed_seconds"),
+          },
+          "ddp_training": {
+              "training_type": ddp_metadata.get("training_type"),
+              "world_size": ddp_metadata.get("world_size"),
+              "hosts": ddp_metadata.get("hosts"),
+              "cuda_available": ddp_metadata.get("cuda_available"),
+              "cuda_device_name": ddp_metadata.get("cuda_device_name"),
+              "global_batch_size": ddp_metrics.get("global_batch_size"),
+              "avg_final_loss": ddp_metrics.get("avg_final_loss"),
+              "avg_loss": ddp_metrics.get("avg_loss"),
+              "elapsed_seconds": ddp_metrics.get("elapsed_seconds"),
+          },
+      }
+
+      output_path = root / "pipeline-summary.json"
+      output_path.write_text(json.dumps(summary, indent=2) + "\n")
+
+      print(json.dumps(summary, indent=2))
+      print(f"Wrote {output_path}")
+      PY
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - artifacts/
+
+human-review-qwen:
+  stage: review
+  tags:
+    - agenthost
+  needs:
+    - job: slurm-qwen-evaluate
+      optional: true
+    - job: slurm-qwen-evaluate-stability
+      optional: true
+  rules:
+    - if: '$RUN_QWEN_TRAIN == "true" || $RUN_QWEN_STABILITY == "true"'
+      when: on_success
+    - when: manual
+  allow_failure: false
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp"
+
+      echo "Review run: ${RUN_ID}"
+      echo "Evaluation summary:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-summary.json"
+
+      echo ""
+      echo "Review document:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-review.md"
+
+human-review-qwen-format:
+  stage: review
+  tags:
+    - agenthost
+  needs:
+    - job: slurm-qwen-evaluate-format
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp-format"
+
+      echo "Review run: ${RUN_ID}"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-summary.json"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-review.md"
+
+human-review-qwen-format-balanced:
+  stage: review
+  tags:
+    - agenthost
+  needs:
+    - job: slurm-qwen-evaluate-format-balanced
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp-format-balanced"
+
+      echo "Review run: ${RUN_ID}"
+
+      echo "Evaluation summary:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-summary.json"
+
+      echo ""
+      echo "Review document:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/${RUN_ID}/qwen-eval-review.md"
+
+promote-qwen-format-balanced:
+  stage: review
+  tags:
+    - agenthost
+  needs:
+    - job: human-review-qwen-format-balanced
+  when: manual
+  allow_failure: false
+  script:
+    - |
+      set -uo pipefail
+
+      RUN_ID="ci-${CI_PIPELINE_ID}-qwen-ddp-format-balanced"
+
+      echo "Promoting run: ${RUN_ID}"
+
+      ssh chris@spark-38fc "/srv/sparky-mlops/venv/bin/python /srv/sparky-mlops/jobs/ml-training/promote_qwen_adapter.py \
+        --run-id '${RUN_ID}' \
+        --runs-root /srv/sparky-mlops/runs \
+        --promotion-name qwen-current \
+        --decision accepted"
+
+      echo "Promotion record:"
+      ssh chris@spark-38fc "cat /srv/sparky-mlops/runs/promoted/qwen-current.json"

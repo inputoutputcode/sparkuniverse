@@ -1,0 +1,6 @@
+run_name: local-smoke
+model_name: tiny-placeholder
+dataset: toy-instructions
+epochs: 1
+learning_rate: 0.0002
+output_dir: ./runs

@@ -1,0 +1,31 @@
+run_name: qwen-ddp-dev
+model_name: Qwen/Qwen2.5-0.5B-Instruct
+output_dir: /srv/sparky-mlops/runs
+cache_dir: /srv/sparky-mlops/hf-cache
+
+dataset:
+  name: databricks/databricks-dolly-15k
+  split: train
+  max_samples: 12000
+  shuffle: true
+  text_fields:
+    instruction: instruction
+    context: context
+    response: response
+
+epochs: 1
+batch_size: 1
+learning_rate: 0.0002
+max_length: 512
+steps_per_epoch: all
+seed: 42
+
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj

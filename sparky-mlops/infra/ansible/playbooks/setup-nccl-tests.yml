@@ -1,0 +1,47 @@
+- name: Prepare all DGX nodes for NCCL tests
+  hosts: dgx
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Install NCCL test build prerequisites
+      ansible.builtin.apt:
+        name:
+          - build-essential
+          - git
+          - openmpi-bin
+          - libopenmpi-dev
+        state: present
+        update_cache: true
+
+    - name: Verify shared project directory exists
+      ansible.builtin.stat:
+        path: /srv/sparky-mlops
+      register: shared_dir
+
+    - name: Fail if shared project directory is missing
+      ansible.builtin.fail:
+        msg: "/srv/sparky-mlops is missing"
+      when: not shared_dir.stat.exists
+
+    - name: Verify mpirun
+      ansible.builtin.command: which mpirun
+      changed_when: false
+
+    - name: Verify mpicc
+      ansible.builtin.command: which mpicc
+      changed_when: false
+
+    - name: Verify nvidia-smi
+      ansible.builtin.command: nvidia-smi -L
+      changed_when: false
+
+- name: Verify compute nodes have shared storage mounted
+  hosts: slurm_compute
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Verify NFS mount exists
+      ansible.builtin.command: findmnt /srv/sparky-mlops
+      changed_when: false

@@ -1,0 +1,23 @@
+{"instruction":"Classify the sentiment as exactly one label: positive, negative, or neutral.\nText: The package arrived early and works perfectly.","response":"positive"}
+{"instruction":"Classify the sentiment as exactly one label: positive, negative, or neutral.\nText: The product broke after one day and support never replied.","response":"negative"}
+{"instruction":"Classify the sentiment as exactly one label: positive, negative, or neutral.\nText: The meeting starts at 10 AM tomorrow.","response":"neutral"}
+{"instruction":"Classify the sentiment as exactly one label: positive, negative, or neutral.\nText: I love how fast this laptop is.","response":"positive"}
+{"instruction":"Classify the sentiment as exactly one label: positive, negative, or neutral.\nText: The instructions were confusing and incomplete.","response":"negative"}
+{"instruction":"Classify the sentiment as exactly one label: positive, negative, or neutral.\nText: The report contains five sections.","response":"neutral"}
+{"instruction":"Classify the animal type as exactly one label: mammal, bird, reptile, fish, insect.\nAnimal: kangaroo","response":"mammal"}
+{"instruction":"Classify the animal type as exactly one label: mammal, bird, reptile, fish, insect.\nAnimal: ostrich","response":"bird"}
+{"instruction":"Classify the animal type as exactly one label: mammal, bird, reptile, fish, insect.\nAnimal: rattlesnake","response":"reptile"}
+{"instruction":"Classify the animal type as exactly one label: mammal, bird, reptile, fish, insect.\nAnimal: salmon","response":"fish"}
+{"instruction":"Classify the animal type as exactly one label: mammal, bird, reptile, fish, insect.\nAnimal: butterfly","response":"insect"}
+{"instruction":"Classify the instrument as exactly one label: string, woodwind, percussion, brass.\nInstrument: koto","response":"string"}
+{"instruction":"Classify the instrument as exactly one label: string, woodwind, percussion, brass.\nInstrument: fife","response":"woodwind"}
+{"instruction":"Classify the instrument as exactly one label: string, woodwind, percussion, brass.\nInstrument: snare drum","response":"percussion"}
+{"instruction":"Classify the instrument as exactly one label: string, woodwind, percussion, brass.\nInstrument: trumpet","response":"brass"}
+{"instruction":"Use only the context to answer.\nContext: Falcon 9 is a partially reusable rocket manufactured by SpaceX.\nQuestion: Who manufactures Falcon 9?","response":"SpaceX"}
+{"instruction":"Use only the context to answer.\nContext: Photosynthesis converts light energy into chemical energy in plants.\nQuestion: What type of energy is produced?","response":"chemical energy"}
+{"instruction":"Use only the context to answer.\nContext: Dogecoin was created by software engineers Billy Markus and Jackson Palmer and launched on December 6, 2013.\nQuestion: Who created Dogecoin?","response":"Billy Markus and Jackson Palmer"}
+{"instruction":"Use only the context to answer.\nContext: Mother Teresa was fluent in Bengali, Albanian, Serbian, English, and Hindi.\nQuestion: How many languages was Mother Teresa fluent in?","response":"five"}
+{"instruction":"Extract name, date, and location as JSON only.\nText: Maria Chen will present the quarterly update in Berlin on March 12, 2027.","response":"{\"name\":\"Maria Chen\",\"date\":\"March 12, 2027\",\"location\":\"Berlin\"}"}
+{"instruction":"Extract product, price, and currency as JSON only.\nText: The laptop stand costs 49.99 USD.","response":"{\"product\":\"laptop stand\",\"price\":\"49.99\",\"currency\":\"USD\"}"}
+{"instruction":"Extract company, city, and country as JSON only.\nText: Databricks is headquartered in San Francisco, United States.","response":"{\"company\":\"Databricks\",\"city\":\"San Francisco\",\"country\":\"United States\"}"}
+{"instruction":"Extract person, role, and organization as JSON only.\nText: Satya Nadella is the CEO of Microsoft.","response":"{\"person\":\"Satya Nadella\",\"role\":\"CEO\",\"organization\":\"Microsoft\"}"}

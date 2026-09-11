@@ -1,0 +1,7 @@
+{
+ "requests": 128,
+ "prompt_tokens": 0,
+ "cached_tokens": 0,
+ "reuse_rate": 0,
+ "output_tokens": 0
+}

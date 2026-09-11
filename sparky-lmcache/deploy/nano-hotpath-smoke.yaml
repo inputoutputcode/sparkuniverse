@@ -1,0 +1,326 @@
+# Hot-path smoke for LMCache P2P and shared/remote L2 on two DGX Sparks.
+#
+# This is not a benchmark arm. It is built to answer four operational questions:
+#   1. Did the LMCache MP servers start with P2P over the NIXL transfer engine?
+#   2. Did Kubernetes give the workers the RDMA device and UCX pin?
+#   3. Does a repeat prompt routed to the other node hit peer L1 over P2P?
+#   4. If L1 is cleared, can the other node hit shared/remote L2 instead of
+#      recomputing prefill?
+#
+# Default L2_ADAPTER_MODE=none isolates P2P. For shared-L2 testing set one of:
+#
+#   fs_native_shared
+#     Requires the same shared filesystem mounted on both hosts at L2_PATH.
+#
+#   nixl_posix_dynamic_shared
+#     Same shared mount, but through LMCache's NIXL dynamic POSIX storage.
+#
+#   resp
+#     Redis/Valkey remote L2. Set RESP_HOST and RESP_PORT.
+#
+# The frontend uses round_robin intentionally. KV routing is what you want in
+# production, but it defeats this test by sending a repeated prompt back to the
+# worker that already owns it.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hotpath-smoke-worker-entrypoint
+  namespace: dynamo-system
+data:
+  start.sh: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    ulimit -l unlimited
+    : "${NODE_IP:?downward API did not provide status.hostIP}"
+
+    P2P_ARGS=()
+    if [ "${P2P_ENABLED:-1}" = 1 ]; then
+      : "${COORDINATOR_URL:?P2P_ENABLED=1 requires COORDINATOR_URL}"
+      : "${P2P_PORT:?P2P_ENABLED=1 requires P2P_PORT}"
+      P2P_ARGS=(--p2p-advertise-url "${NODE_IP}:${P2P_PORT}"
+                --p2p-transfer-engine nixl
+                --coordinator-url "${COORDINATOR_URL}"
+                --coordinator-advertise-ip "${NODE_IP}")
+      echo "hotpath smoke on ${NODE_IP}: P2P on, transfer engine nixl, coordinator ${COORDINATOR_URL}"
+    else
+      echo "hotpath smoke on ${NODE_IP}: P2P OFF"
+    fi
+
+    L2_ARGS=()
+    case "${L2_ADAPTER_MODE:-none}" in
+      none|"")
+        echo "hotpath smoke on ${NODE_IP}: no explicit L2 adapter"
+        ;;
+      fs_shared)
+        mkdir -p "${L2_PATH:?L2_PATH required for fs_shared}"
+        L2_ARGS=(--l2-adapter "{\"type\":\"fs\",\"base_path\":\"${L2_PATH}\",\"use_odirect\":false}")
+        echo "hotpath smoke on ${NODE_IP}: shared fs L2 at ${L2_PATH}"
+        ;;
+      fs_native_shared)
+        mkdir -p "${L2_PATH:?L2_PATH required for fs_native_shared}"
+        L2_ARGS=(--l2-adapter "{\"type\":\"fs_native\",\"base_path\":\"${L2_PATH}\",\"num_workers\":${L2_NUM_WORKERS:-32},\"use_odirect\":false}")
+        echo "hotpath smoke on ${NODE_IP}: shared fs_native L2 at ${L2_PATH}"
+        ;;
+      nixl_posix_dynamic_shared)
+        mkdir -p "${L2_PATH:?L2_PATH required for nixl_posix_dynamic_shared}"
+        L2_ARGS=(--l2-adapter "{\"type\":\"nixl_store_dynamic\",\"backend\":\"POSIX\",\"backend_params\":{\"file_path\":\"${L2_PATH}\",\"use_direct_io\":\"false\",\"max_capacity_gb\":\"${L2_MAX_GB:-200}\"}}")
+        echo "hotpath smoke on ${NODE_IP}: shared nixl_store_dynamic POSIX L2 at ${L2_PATH}"
+        ;;
+      resp)
+        : "${RESP_HOST:?RESP_HOST required for resp L2}"
+        : "${RESP_PORT:?RESP_PORT required for resp L2}"
+        L2_ARGS=(--l2-adapter "{\"type\":\"resp\",\"host\":\"${RESP_HOST}\",\"port\":${RESP_PORT},\"num_workers\":${L2_NUM_WORKERS:-16},\"max_capacity_gb\":${L2_MAX_GB:-50}}")
+        echo "hotpath smoke on ${NODE_IP}: RESP L2 at ${RESP_HOST}:${RESP_PORT}"
+        ;;
+      *)
+        echo "unknown L2_ADAPTER_MODE=${L2_ADAPTER_MODE}" >&2
+        exit 42
+        ;;
+    esac
+
+    EVENT_ARGS=()
+    if [ "${COORD_EVENT_REPORTING:-0}" = 1 ]; then
+      if lmcache server --help 2>&1 | grep -q -- '--coordinator-event-reporting'; then
+        EVENT_ARGS=(--coordinator-event-reporting)
+      elif lmcache server --help 2>&1 | grep -q -- '--coordinator-l2-event-reporting'; then
+        EVENT_ARGS=(--coordinator-l2-event-reporting)
+      else
+        echo "hotpath smoke on ${NODE_IP}: no coordinator event-reporting flag in this build"
+      fi
+      echo "hotpath smoke on ${NODE_IP}: coordinator event reporting requested: ${EVENT_ARGS[*]:-unavailable}"
+    fi
+
+    lmcache server \
+      --host 0.0.0.0 --port 5555 \
+      --http-port 9500 \
+      --l1-size-gb "${L1_SIZE_GB}" \
+      --chunk-size "${CHUNK_SIZE}" \
+      --eviction-policy LRU \
+      --eviction-trigger-watermark "${EVICTION_WATERMARK:-0.95}" \
+      --eviction-ratio "${EVICTION_RATIO:-0.05}" \
+      --l2-prefetch-policy "${L2_PREFETCH_POLICY:-default}" \
+      --instance-id "spark-${NODE_IP##*.}" \
+      "${P2P_ARGS[@]}" \
+      "${L2_ARGS[@]}" \
+      "${EVENT_ARGS[@]}" &
+
+    for i in $(seq 60); do
+      (echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null && break
+      sleep 2
+    done
+    (echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null || {
+      echo "LMCACHE_START_FAIL: server never listened on 5555"; exit 41; }
+
+    exec python3 -m dynamo.vllm "$@"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lmcache-coordinator
+  namespace: dynamo-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: lmcache-coordinator }
+  template:
+    metadata:
+      labels: { app: lmcache-coordinator }
+    spec:
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/hostname: spark-a
+      containers:
+        - name: coordinator
+          image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+          imagePullPolicy: IfNotPresent
+          command: ["lmcache"]
+          args:
+            - coordinator
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "9300"
+            - --chunk-size
+            - "2128"
+          ports:
+            - { name: http, containerPort: 9300 }
+          readinessProbe:
+            tcpSocket: { port: 9300 }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nano-hotpath-smoke-frontend-ext
+  namespace: dynamo-system
+spec:
+  type: NodePort
+  selector:
+    nvidia.com/selector: nano-hotpath-smoke-frontend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30805
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: nano-hotpath-smoke
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  components:
+    - name: Frontend
+      type: frontend
+      replicas: 1
+      podTemplate:
+        spec:
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["python3"]
+              args:
+                - -m
+                - dynamo.frontend
+              env:
+                - name: DYN_ROUTER_MODE
+                  value: "round_robin"
+              ports:
+                - { name: http, containerPort: 8000 }
+              startupProbe:
+                httpGet: { path: /health, port: 8000 }
+                periodSeconds: 10
+                failureThreshold: 60
+
+    - name: VllmDecodeWorker
+      type: worker
+      replicas: 2
+      podTemplate:
+        spec:
+          hostNetwork: true
+          hostIPC: true
+          dnsPolicy: ClusterFirstWithHostNet
+          volumes:
+            - name: hf-cache
+              hostPath: { path: /home/user/hf-cache, type: Directory }
+            - name: entrypoint
+              configMap:
+                name: hotpath-smoke-worker-entrypoint
+                defaultMode: 0755
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 24Gi }
+            - name: l2
+              hostPath: { path: /mnt/shared-lmcache-l2, type: DirectoryOrCreate }
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["/entrypoint/start.sh"]
+              args:
+                - --model
+                - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+                - --served-model-name
+                - nemotron
+                - --trust-remote-code
+                - --load-format
+                - fastsafetensors
+                - --moe-backend
+                - cutlass
+                - --kv-cache-dtype
+                - fp8
+                - --mamba-ssm-cache-dtype
+                - bfloat16
+                - --mamba-cache-mode
+                - align
+                - --enable-chunked-prefill
+                - --enable-prefix-caching
+                - --dyn-reasoning-parser
+                - nemotron_v3
+                - --dyn-tool-call-parser
+                - nemotron_nano
+                - --max-model-len
+                - "131072"
+                - --max-num-seqs
+                - "8"
+                - --max-num-batched-tokens
+                - "4255"
+                - --kv-cache-memory-bytes
+                - "10000000000"
+                - --gpu-memory-utilization
+                - "0.45"
+                - --kv-transfer-config
+                - '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute"}'
+              env:
+                - name: NODE_IP
+                  valueFrom:
+                    fieldRef: { fieldPath: status.hostIP }
+                - name: COORDINATOR_URL
+                  value: "http://10.1.0.11:9300"
+                - name: CHUNK_SIZE
+                  value: "2128"
+                - name: L1_SIZE_GB
+                  value: "12"
+                - name: P2P_ENABLED
+                  value: "1"
+                - name: P2P_PORT
+                  value: "9450"
+                - name: L2_PREFETCH_POLICY
+                  value: "default"
+                - name: EVICTION_WATERMARK
+                  value: "0.95"
+                - name: EVICTION_RATIO
+                  value: "0.05"
+                - name: L2_ADAPTER_MODE
+                  value: "none"
+                - name: L2_PATH
+                  value: "/l2"
+                - name: L2_NUM_WORKERS
+                  value: "32"
+                - name: L2_MAX_GB
+                  value: "200"
+                - name: RESP_HOST
+                  value: ""
+                - name: RESP_PORT
+                  value: "6379"
+                - name: COORD_EVENT_REPORTING
+                  value: "0"
+                - name: UCX_NET_DEVICES
+                  value: "rocep1s0f1:1,roceP2p1s0f1:1"
+                - name: UCX_MAX_RNDV_RAILS
+                  value: "2"
+                - name: UCX_CM_USE_ALL_DEVICES
+                  value: "y"
+                - name: HF_HOME
+                  value: "/hf-cache"
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: VLLM_OMNI_USE_QUACK_FP8
+                  value: "0"
+                - name: PYTHONHASHSEED
+                  value: "42"
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK, SYS_RESOURCE]
+                runAsUser: 0
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                requests:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                  memory: 24Gi
+              volumeMounts:
+                - { name: hf-cache, mountPath: /hf-cache }
+                - { name: entrypoint, mountPath: /entrypoint }
+                - { name: dshm, mountPath: /dev/shm }
+                - { name: l2, mountPath: /l2 }
+              startupProbe:
+                httpGet: { path: /live, port: 9090 }
+                periodSeconds: 30
+                failureThreshold: 40

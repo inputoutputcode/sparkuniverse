@@ -1,0 +1,16 @@
+{
+  "run_id": "weka-c-rep2",
+  "arm": "p2p",
+  "model": "nano",
+  "endpoint": "http://localhost:8000",
+  "trace": "cc-weka-s85-128k",
+  "trace_requests": 3485,
+  "requests_sent": 3485,
+  "dataset_type": "weka_trace",
+  "concurrency": 10,
+  "seed": 42,
+  "chunk_size": 2128,
+  "block_size": null,
+  "tokenizer": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+  "started": "2026-08-18T08:37:06Z"
+}

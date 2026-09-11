@@ -1,0 +1,16 @@
+{
+  "run_id": "super-local-disk-l2-400",
+  "arm": "p2p",
+  "model": "super",
+  "endpoint": "http://localhost:8000",
+  "trace": "cc-weka-s85-128k",
+  "trace_requests": 3485,
+  "requests_sent": 3485,
+  "dataset_type": "weka_trace",
+  "concurrency": 10,
+  "seed": 42,
+  "chunk_size": 4224,
+  "block_size": null,
+  "tokenizer": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+  "started": "2026-08-21T19:05:27Z"
+}

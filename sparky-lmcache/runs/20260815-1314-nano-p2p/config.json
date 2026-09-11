@@ -1,0 +1,14 @@
+{
+  "run_id": "20260815-1314-nano-p2p",
+  "arm": "p2p",
+  "model": "nano",
+  "endpoint": "http://10.0.0.11:30800",
+  "trace": "cc-weka-s10-128k-flat.jsonl",
+  "sessions":      310,
+  "concurrency": 5,
+  "seed": 42,
+  "chunk_size": 2128,
+  "block_size": 64,
+  "tokenizer": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+  "started": "2026-08-15T20:14:40Z"
+}

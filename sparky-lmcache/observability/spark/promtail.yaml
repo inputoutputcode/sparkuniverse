@@ -1,0 +1,90 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: warn
+
+positions:
+  filename: /tmp/promtail-positions.yaml
+
+clients:
+  - url: ${LOKI_URL}
+
+scrape_configs:
+  # k3s runs containerd, not dockerd, so the docker job below sees nothing from
+  # the deployment. It was written when vLLM ran under bare docker for the
+  # bench/* scripts, and when the workload moved into k3s log collection stopped
+  # without any error: Loki simply held one container label, obs-cadvisor, and
+  # the dashboard's log panel went quiet for weeks.
+  #
+  # containerd writes to /var/log/pods/<ns>_<pod>_<uid>/<container>/N.log, in
+  # CRI format (RFC3339 stream flags message), which the cri stage parses.
+  - job_name: k3s-pods
+    static_configs:
+      - targets: [localhost]
+        labels:
+          node: '${HOSTNAME}'
+          __path__: /var/log/pods/*/*/*.log
+    pipeline_stages:
+      # First, or every entry keeps the containerd timestamp and stream prefix
+      # and the multiline anchor below never matches.
+      - cri: {}
+      - regex:
+          source: filename
+          expression: '/var/log/pods/(?P<namespace>[^_]+)_(?P<pod>[^_]+)_[^/]+/(?P<container>[^/]+)/'
+      - labels:
+          namespace:
+          pod:
+          container:
+      # Same anchors as the docker job. vLLM tracebacks span many lines and are
+      # unreadable one line per entry.
+      - multiline:
+          firstline: '^(\(APIServer|\(EngineCore|\[\d{4}-\d{2}-\d{2}|INFO|WARNING|ERROR|DEBUG)'
+          max_wait_time: 3s
+          max_lines: 400
+      - regex:
+          expression: '(?P<level>INFO|WARNING|ERROR|DEBUG|CRITICAL)'
+      - labels:
+          level:
+      - regex:
+          expression: '(?P<retained>\d+)/(?P<requested>\d+) retained keys \((?P<l1>\d+) L1, (?P<l2>\d+) L2\)'
+      - labels:
+          retained:
+          requested:
+
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 10s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: container
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: stream
+      - target_label: node
+        replacement: '${HOSTNAME}'
+    pipeline_stages:
+      # vLLM tracebacks span many lines. Without this each line is a separate
+      # entry and the root cause is unreadable in Loki. Anchor on the vLLM log
+      # prefix; anything not matching is appended to the previous entry.
+      - multiline:
+          firstline: '^(\(APIServer|\(EngineCore|\[\d{4}-\d{2}-\d{2}|INFO|WARNING|ERROR|DEBUG)'
+          max_wait_time: 3s
+          max_lines: 400
+      - regex:
+          expression: '(?P<level>INFO|WARNING|ERROR|DEBUG|CRITICAL)'
+      - labels:
+          level:
+      # LMCache emits the cache-tier facts we care about as plain log lines,
+      # because nothing LMCache-related appears on vLLM's /metrics endpoint.
+      - regex:
+          expression: 'Stored (?P<stored_tokens>\d+) tokens'
+      - regex:
+          expression: 'Retrieved (?P<retrieved_tokens>\d+) tokens'
+      - regex:
+          expression: '(?P<retained>\d+)/(?P<requested>\d+) retained keys \((?P<l1>\d+) L1, (?P<l2>\d+) L2\)'
+      - labels:
+          stored_tokens:
+          retrieved_tokens:
+          retained:
+          requested:

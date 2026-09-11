@@ -1,0 +1,10 @@
+run_name: real-dev
+output_dir: /srv/sparky-mlops/runs
+epochs: 2
+batch_size: 8
+learning_rate: 0.001
+input_dim: 128
+hidden_dim: 256
+num_classes: 4
+steps_per_epoch: 50
+device: cuda

@@ -1,0 +1,38 @@
+base_model: Qwen/Qwen2.5-0.5B-Instruct
+dataset_name: databricks/databricks-dolly-15k
+dataset_split: train
+dataset_max_samples: 15000
+seed: 42
+
+supplemental_jsonl_path: ml-training/data/format-supplement.jsonl
+supplemental_repeat: 20
+
+output_dir: /srv/sparky-mlops/runs
+
+epochs: 1
+steps_per_epoch: all
+batch_size_per_rank: 1
+gradient_accumulation_steps: 4
+
+max_length: 768
+learning_rate: 0.00005
+weight_decay: 0.01
+warmup_ratio: 0.05
+max_grad_norm: 1.0
+
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.1
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+save_adapter: true
+adapter_subdir: qwen-lora-adapter
+
+log_every: 50

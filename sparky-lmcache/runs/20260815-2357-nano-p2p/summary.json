@@ -1,0 +1,17 @@
+{
+ "requests": 1000.0,
+ "duration_s": 8438.923332608001,
+ "req_per_hour": 426.5918824174101,
+ "output_tok_s": 259.77217881612097,
+ "output_tok_s_user": 30.416099367826956,
+ "total_output_tokens": 2192212.0,
+ "total_prompt_tokens": 44223691.0,
+ "cached_prompt_tokens": 34018208.0,
+ "cache_read_pct": 76.92304109125581,
+ "ttft_p50_ms": 626.494333,
+ "ttft_p90_ms": 25289.759345500002,
+ "itl_p50_ms": 33.16233025182254,
+ "isl_p50": 56349.5,
+ "osl_p50": 359.0,
+ "recovered": true
+}

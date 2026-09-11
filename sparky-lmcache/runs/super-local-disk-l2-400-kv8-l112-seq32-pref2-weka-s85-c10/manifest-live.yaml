@@ -1,0 +1,210 @@
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  annotations:
+    kubectl.kubernetes.io/last-applied-configuration: |
+      {"apiVersion":"nvidia.com/v1beta1","kind":"DynamoGraphDeployment","metadata":{"annotations":{},"name":"super-agg-p2p","namespace":"dynamo-system"},"spec":{"backendFramework":"vllm","components":[{"name":"Frontend","podTemplate":{"spec":{"containers":[{"args":["-m","dynamo.frontend"],"command":["python3"],"env":[{"name":"DYN_ROUTER_MODE","value":"kv"},{"name":"DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY","value":"0.0"}],"image":"dynamo-vllm-lmcache:1.3.0-lmc052-arm64","imagePullPolicy":"IfNotPresent","name":"main","ports":[{"containerPort":8000,"name":"http"}],"startupProbe":{"failureThreshold":60,"httpGet":{"path":"/health","port":8000},"periodSeconds":10}}]}},"replicas":1,"type":"frontend"},{"name":"VllmDecodeWorker","podTemplate":{"spec":{"containers":[{"args":["--model","nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4","--served-model-name","nemotron","--trust-remote-code","--load-format","fastsafetensors","--moe-backend","cutlass","--kv-cache-dtype","fp8","--mamba-ssm-cache-dtype","bfloat16","--mamba-cache-mode","align","--enable-chunked-prefill","--enable-prefix-caching","--dyn-reasoning-parser","nemotron_v3","--dyn-tool-call-parser","nemotron_nano","--max-model-len","131072","--max-num-seqs","5","--max-num-batched-tokens","8447","--kv-cache-memory-bytes","16000000000","--gpu-memory-utilization","0.82","--kv-transfer-config","{\"kv_connector\":\"LMCacheMPConnector\",\"kv_role\":\"kv_both\"}"],"command":["/entrypoint/start.sh"],"env":[{"name":"NODE_IP","valueFrom":{"fieldRef":{"fieldPath":"status.hostIP"}}},{"name":"COORDINATOR_URL","value":"http://10.1.0.11:9300"},{"name":"CHUNK_SIZE","value":"4224"},{"name":"L1_SIZE_GB","value":"4"},{"name":"P2P_ENABLED","value":"0"},{"name":"L2_PREFETCH_POLICY","value":"default"},{"name":"L2_ADAPTER_MODE","value":"fs_native"},{"name":"L2_PATH","value":"/l2disk"},{"name":"L2_NUM_WORKERS","value":"32"},{"name":"L2_MAX_GB","value":"400"},{"name":"L2_USE_ODIRECT","value":"true"},{"name":"L2_STORE_POLICY","value":""},{"name":"EVICTION_RATIO","value":"0.05"},{"name":"EVICTION_WATERMARK","value":"0.95"},{"name":"P2P_PORT","value":"9450"},{"name":"UCX_NET_DEVICES","value":"rocep1s0f1:1"},{"name":"HF_HOME","value":"/hf-cache"},{"name":"HF_HUB_OFFLINE","value":"1"},{"name":"VLLM_OMNI_USE_QUACK_FP8","value":"0"},{"name":"PYTHONHASHSEED","value":"42"}],"image":"dynamo-vllm-lmcache:1.3.0-lmc052-arm64","imagePullPolicy":"IfNotPresent","name":"main","resources":{"limits":{"nvidia.com/gpu":"1","rdma/rdma_shared_device_a":"1"},"requests":{"memory":"24Gi","nvidia.com/gpu":"1","rdma/rdma_shared_device_a":"1"}},"securityContext":{"capabilities":{"add":["IPC_LOCK","SYS_RESOURCE"]},"runAsUser":0},"startupProbe":{"failureThreshold":80,"httpGet":{"path":"/live","port":9090},"periodSeconds":30},"volumeMounts":[{"mountPath":"/hf-cache","name":"hf-cache"},{"mountPath":"/entrypoint","name":"entrypoint"},{"mountPath":"/dev/shm","name":"dshm"},{"mountPath":"/l2disk","name":"l2disk"}]}],"dnsPolicy":"ClusterFirstWithHostNet","hostIPC":true,"hostNetwork":true,"volumes":[{"hostPath":{"path":"/home/user/hf-cache","type":"Directory"},"name":"hf-cache"},{"configMap":{"defaultMode":493,"name":"super-lmcache-worker-entrypoint"},"name":"entrypoint"},{"emptyDir":{"medium":"Memory","sizeLimit":"24Gi"},"name":"dshm"},{"hostPath":{"path":"/mnt/lmcache-l2","type":"DirectoryOrCreate"},"name":"l2disk"}]}},"replicas":2,"type":"worker"}]}}
+    nvidia.com/current-worker-hash: 1fefd2ce
+    nvidia.com/current-worker-hash-v2: c9b958a5
+    nvidia.com/dynamo-operator-origin-version: 1.2.1
+  creationTimestamp: "2026-08-22T14:06:57Z"
+  finalizers:
+  - nvidia.com/finalizer
+  generation: 1
+  name: super-agg-p2p
+  namespace: dynamo-system
+  resourceVersion: "4027219"
+  uid: 7a73f2e9-59f6-419c-8785-12e2b4f14ce8
+spec:
+  backendFramework: vllm
+  components:
+  - name: Frontend
+    podTemplate:
+      spec:
+        containers:
+        - args:
+          - -m
+          - dynamo.frontend
+          command:
+          - python3
+          env:
+          - name: DYN_ROUTER_MODE
+            value: kv
+          - name: DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY
+            value: "0.0"
+          image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+          imagePullPolicy: IfNotPresent
+          name: main
+          ports:
+          - containerPort: 8000
+            name: http
+            protocol: TCP
+          startupProbe:
+            failureThreshold: 60
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+    replicas: 1
+    type: frontend
+  - name: VllmDecodeWorker
+    podTemplate:
+      spec:
+        containers:
+        - args:
+          - --model
+          - nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+          - --served-model-name
+          - nemotron
+          - --trust-remote-code
+          - --load-format
+          - fastsafetensors
+          - --moe-backend
+          - cutlass
+          - --kv-cache-dtype
+          - fp8
+          - --mamba-ssm-cache-dtype
+          - bfloat16
+          - --mamba-cache-mode
+          - align
+          - --enable-chunked-prefill
+          - --enable-prefix-caching
+          - --dyn-reasoning-parser
+          - nemotron_v3
+          - --dyn-tool-call-parser
+          - nemotron_nano
+          - --max-model-len
+          - "131072"
+          - --max-num-seqs
+          - "5"
+          - --max-num-batched-tokens
+          - "8447"
+          - --kv-cache-memory-bytes
+          - "16000000000"
+          - --gpu-memory-utilization
+          - "0.82"
+          - --kv-transfer-config
+          - '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}'
+          command:
+          - /entrypoint/start.sh
+          env:
+          - name: NODE_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.hostIP
+          - name: COORDINATOR_URL
+            value: http://10.1.0.11:9300
+          - name: CHUNK_SIZE
+            value: "4224"
+          - name: L1_SIZE_GB
+            value: "4"
+          - name: P2P_ENABLED
+            value: "0"
+          - name: L2_PREFETCH_POLICY
+            value: default
+          - name: L2_ADAPTER_MODE
+            value: fs_native
+          - name: L2_PATH
+            value: /l2disk
+          - name: L2_NUM_WORKERS
+            value: "32"
+          - name: L2_MAX_GB
+            value: "400"
+          - name: L2_USE_ODIRECT
+            value: "true"
+          - name: L2_STORE_POLICY
+          - name: EVICTION_RATIO
+            value: "0.05"
+          - name: EVICTION_WATERMARK
+            value: "0.95"
+          - name: P2P_PORT
+            value: "9450"
+          - name: UCX_NET_DEVICES
+            value: rocep1s0f1:1
+          - name: HF_HOME
+            value: /hf-cache
+          - name: HF_HUB_OFFLINE
+            value: "1"
+          - name: VLLM_OMNI_USE_QUACK_FP8
+            value: "0"
+          - name: PYTHONHASHSEED
+            value: "42"
+          image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+          imagePullPolicy: IfNotPresent
+          name: main
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              rdma/rdma_shared_device_a: "1"
+            requests:
+              memory: 24Gi
+              nvidia.com/gpu: "1"
+              rdma/rdma_shared_device_a: "1"
+          securityContext:
+            capabilities:
+              add:
+              - IPC_LOCK
+              - SYS_RESOURCE
+            runAsUser: 0
+          startupProbe:
+            failureThreshold: 80
+            httpGet:
+              path: /live
+              port: 9090
+            periodSeconds: 30
+          volumeMounts:
+          - mountPath: /hf-cache
+            name: hf-cache
+          - mountPath: /entrypoint
+            name: entrypoint
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /l2disk
+            name: l2disk
+        dnsPolicy: ClusterFirstWithHostNet
+        hostIPC: true
+        hostNetwork: true
+        volumes:
+        - hostPath:
+            path: /home/user/hf-cache
+            type: Directory
+          name: hf-cache
+        - configMap:
+            defaultMode: 493
+            name: super-lmcache-worker-entrypoint
+          name: entrypoint
+        - emptyDir:
+            medium: Memory
+            sizeLimit: 24Gi
+          name: dshm
+        - hostPath:
+            path: /mnt/lmcache-l2
+            type: DirectoryOrCreate
+          name: l2disk
+    replicas: 2
+    type: worker
+status:
+  components:
+    Frontend:
+      componentKind: PodClique
+      componentNames:
+      - super-agg-p2p-0-frontend
+      readyReplicas: 0
+      replicas: 1
+      updatedReplicas: 1
+    VllmDecodeWorker:
+      componentKind: PodClique
+      componentNames:
+      - super-agg-p2p-0-vllmdecodeworker
+      readyReplicas: 0
+      replicas: 2
+      updatedReplicas: 2
+  conditions:
+  - lastTransitionTime: "2026-08-24T16:40:29Z"
+    message: 'Resources not ready: super-agg-p2p: podclique/super-agg-p2p-0-frontend:
+      desired=1, ready=0; podclique/super-agg-p2p-0-vllmdecodeworker: desired=2, ready=0'
+    reason: some_resources_are_not_ready
+    status: "False"
+    type: Ready
+  observedGeneration: 1
+  state: pending

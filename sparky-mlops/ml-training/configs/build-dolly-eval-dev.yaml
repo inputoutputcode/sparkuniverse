@@ -1,0 +1,6 @@
+dataset_name: databricks/databricks-dolly-15k
+split: train
+seed: 42
+total_examples: 100
+max_per_category: 20
+output_path: ml-training/evals/dolly-heldout-dev.jsonl

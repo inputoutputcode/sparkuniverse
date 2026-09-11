@@ -1,0 +1,19 @@
+{
+ "requests": 3484.0,
+ "duration_s": 10639.612242944,
+ "req_per_hour": 1178.8321401813268,
+ "output_tok_s": 243.37877906395596,
+ "output_tok_s_user": 19.86478305027147,
+ "total_output_tokens": 2589473.0,
+ "total_prompt_tokens": 231320368.0,
+ "cached_prompt_tokens": 212223312.0,
+ "cache_read_pct": 91.74432577420075,
+ "ttft_p50_ms": 1057.406833,
+ "ttft_p90_ms": 3747.147462600001,
+ "itl_p50_ms": 49.07520479245282,
+ "isl_p50": 66983.5,
+ "osl_p50": 311.0,
+ "theoretical_prefix_cache_hit": 94.29155027284072,
+ "theoretical_prefix_cache_hit_total_blocks": 3605217,
+ "theoretical_prefix_cache_hit_hit_blocks": 3399415
+}

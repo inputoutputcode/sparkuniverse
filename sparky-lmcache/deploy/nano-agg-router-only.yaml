@@ -1,0 +1,233 @@
+# Arm A: KV-aware routing, no LMCache. The baseline for nano-agg-p2p.yaml.
+#
+# Exactly four things differ from nano-agg-p2p.yaml. Everything else -- device
+# arena, max-num-seqs, router mode and decay, model, chunk size, RDMA resource,
+# hostNetwork, the hf-cache mount -- is byte-identical, because a comparison
+# with two variables answers nothing.
+#
+#   1. the worker entrypoint does not start an LMCache server
+#   2. --kv-transfer-config is absent, so vLLM runs with device prefix caching
+#      alone
+#   3. no coordinator Deployment
+#   4. the NodePort is 30801, so this can be applied without deleting the other
+#      Service
+#
+# **The 17 GiB L1 arena is simply not allocated here, and not given to the
+# device cache either.** That is deliberate. This arm measures what LMCache
+# contributes at a fixed device capacity. Handing arm A the freed memory would
+# change two things at once.
+#
+# If you want the other question -- "is 17 GiB better spent as device cache or
+# as LMCache L1" -- run a third arm with --kv-cache-memory-bytes raised to
+# 28000000000 and nothing else changed. It is a good question and a different
+# one.
+#
+# Run it the same way, same trace, same concurrency:
+#   ARM=router MODEL=nano ENDPOINT=http://localhost:8001 BLOCK_SIZE=512 \
+#     TRACE=../traces/data/agent-1000.jsonl CONCURRENCY=10 ./run-scenario.sh
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: router-only-worker-entrypoint
+  namespace: dynamo-system
+data:
+  # No LMCache server. The only reason this is a script at all rather than a
+  # plain command is to keep the two arms structurally identical -- same
+  # ConfigMap-mounted entrypoint, same ulimit, same exec.
+  start.sh: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    ulimit -l unlimited
+    : "${NODE_IP:?downward API did not provide status.hostIP}"
+    echo "router-only worker on ${NODE_IP}, no LMCache"
+    exec python3 -m dynamo.vllm "$@"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nano-agg-router-frontend-ext
+  namespace: dynamo-system
+spec:
+  type: NodePort
+  selector:
+    nvidia.com/selector: nano-agg-router-frontend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30801
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: nano-agg-router
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  components:
+    - name: Frontend
+      type: frontend
+      replicas: 1
+      # Nothing can be mounted here; the operator's frontend defaulter strips
+      # volumes. The workers advertise a repo id so the frontend resolves the
+      # tokenizer from the hub. See dead-ends.md.
+      podTemplate:
+        spec:
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["python3"]
+              args:
+                - -m
+                - dynamo.frontend
+              env:
+                - name: DYN_ROUTER_MODE
+                  value: kv
+                # Identical to the p2p arm. Stock default; the 26/22 split at
+                # c5 was slot starvation, not the router hoarding.
+                - name: DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY
+                  value: "0.0"
+              ports:
+                - { name: http, containerPort: 8000 }
+              startupProbe:
+                httpGet: { path: /health, port: 8000 }
+                periodSeconds: 10
+                failureThreshold: 60
+
+    - name: VllmDecodeWorker
+      type: worker
+      replicas: 2
+      podTemplate:
+        spec:
+          hostNetwork: true
+          hostIPC: true
+          dnsPolicy: ClusterFirstWithHostNet
+          volumes:
+            - name: hf-cache
+              hostPath: { path: /home/user/hf-cache, type: Directory }
+            - name: entrypoint
+              configMap:
+                name: router-only-worker-entrypoint
+                defaultMode: 0755
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 24Gi }
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["/entrypoint/start.sh"]
+              args:
+                - --model
+                - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+                - --served-model-name
+                - nemotron
+                - --trust-remote-code
+                - --load-format
+                - fastsafetensors
+                - --moe-backend
+                - cutlass
+                - --kv-cache-dtype
+                - fp8
+                - --mamba-ssm-cache-dtype
+                - bfloat16
+                - --mamba-cache-mode
+                - align
+                - --enable-chunked-prefill
+                - --enable-prefix-caching
+                # Kept identical to the p2p arm. These affect postprocessing
+                # of the response, not token generation, and the benchmark
+                # runs with ignore_eos so output lengths are fixed either way
+                # -- but a difference here would still be a second variable.
+                - --dyn-reasoning-parser
+                - nemotron_v3
+                - --dyn-tool-call-parser
+                - nemotron_nano
+                - --max-model-len
+                - "131072"
+                - --max-num-seqs
+                - "32"
+                - --max-num-batched-tokens
+                - "4255"
+                # Identical to the p2p arm: 10 GB, 2,862,986 tokens. Not raised
+                # to absorb the L1 that is not allocated here.
+                # 56 GB, not 10, and not the maximum either.
+                #
+                # router-only-3 ran at 10 GB, matching the P2P arms' arena so
+                # that only LMCache differed. That is the wrong baseline for the
+                # four-arm comparison: arms B, C and D each spend 68.7 GB on L1
+                # that this arm does not, so 10 GB asks whether LMCache beats a
+                # deliberately starved device cache.
+                #
+                # Enough, rather than maximum. The cc-weka-s85 working set is
+                # 12,593,600 tokens, and the device stores 3,492 B/token, so
+                # 44.0 GB holds all of it. The live set at concurrency 10 with
+                # 128k contexts is 1,310,720 tokens, 4.6 GB more. 56 GB covers
+                # both with margin and never misses after warmup. Beyond that
+                # there is nothing left to cache, so a larger arena adds OOM
+                # risk for no effect.
+                #
+                # This is the boundary condition the article turns on: on Nano
+                # the device cache holds the entire working set in 44 GB, while
+                # LMCache would need 187 GB for the same content. That reverses
+                # on Super, whose 74.8 GB of weights leave no room for either.
+                - --kv-cache-memory-bytes
+                - "56000000000"
+                # Raised from 0.40. kv_cache_memory_bytes overrides this per the
+                # flag's help text, but the utilization fraction still bounds
+                # what the allocator will take overall, and 0.40 of 121 GB is
+                # 48 GB, below the 56 GB requested. Leaving it at 0.40 gives an
+                # arena smaller than asked for, or a startup failure, and either
+                # would be attributed to the wrong thing.
+                #
+                # Verify after deploy, do not assume:
+                #   grep -i "GPU KV cache size" in the worker log should report
+                #   about 16,036,000 tokens. Anything near 2,862,986 means this
+                #   change did not take effect.
+                - --gpu-memory-utilization
+                - "0.75"
+                # No --kv-transfer-config. This is the arm.
+              env:
+                - name: NODE_IP
+                  valueFrom:
+                    fieldRef: { fieldPath: status.hostIP }
+                - name: UCX_NET_DEVICES
+                  value: rocep1s0f1:1,roceP2p1s0f1:1
+                - name: UCX_MAX_RNDV_RAILS
+                  value: "2"
+                - name: UCX_CM_USE_ALL_DEVICES
+                  value: "y"
+                - name: HF_HOME
+                  value: /hf-cache
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: VLLM_OMNI_USE_QUACK_FP8
+                  value: "0"
+                - name: PYTHONHASHSEED
+                  value: "42"
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK, SYS_RESOURCE]
+                runAsUser: 0
+              resources:
+                # The RDMA resource is kept even though nothing here uses the
+                # fabric. It affects scheduling and cgroups, and removing it
+                # would be a second difference between the arms.
+                limits:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                requests:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                  memory: 24Gi
+              volumeMounts:
+                - { name: hf-cache, mountPath: /hf-cache }
+                - { name: entrypoint, mountPath: /entrypoint }
+                - { name: dshm, mountPath: /dev/shm }
+              startupProbe:
+                httpGet: { path: /live, port: 9090 }
+                periodSeconds: 30
+                failureThreshold: 40

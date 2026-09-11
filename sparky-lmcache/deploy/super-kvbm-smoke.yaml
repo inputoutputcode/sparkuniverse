@@ -1,0 +1,189 @@
+# Super KVBM Go/No-Go smoke.
+#
+# Purpose:
+#   Test whether Dynamo's KVBM connector is a viable replacement for LMCache on
+#   Nemotron 3 Super when host memory is too scarce for a large LMCache L1.
+#
+# This intentionally uses a small device KV arena. The benchmark script warms
+# several long unique prompts, then repeats the first one. A fast repeat after
+# that pressure is evidence that KVBM can recover useful KV from G2/G3 rather
+# than relying only on vLLM's device prefix cache.
+#
+# Defaults:
+#   - 2 workers, one per Spark
+#   - Super model constants: mamba align, chunk boundary constraints, 8447 batch
+#   - KVBM CPU tier 4 GiB, disk tier 200 GiB
+#   - device KV 4 GB, deliberately smaller than the production Super arena
+#
+# Override the KVBM env values with bench/deploy-kvbm-smoke.sh.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: super-kvbm-smoke-frontend-ext
+  namespace: dynamo-system
+spec:
+  type: NodePort
+  selector:
+    nvidia.com/selector: super-kvbm-smoke-frontend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30806
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: super-kvbm-smoke
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  components:
+    - name: Frontend
+      type: frontend
+      replicas: 1
+      podTemplate:
+        spec:
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["python3"]
+              args:
+                - -m
+                - dynamo.frontend
+              env:
+                - name: DYN_ROUTER_MODE
+                  value: "kv"
+                - name: DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY
+                  value: "0.0"
+              ports:
+                - { name: http, containerPort: 8000 }
+              startupProbe:
+                httpGet: { path: /health, port: 8000 }
+                periodSeconds: 10
+                failureThreshold: 80
+
+    - name: VllmDecodeWorker
+      type: worker
+      replicas: 2
+      podTemplate:
+        spec:
+          hostNetwork: true
+          hostIPC: true
+          dnsPolicy: ClusterFirstWithHostNet
+          volumes:
+            - name: hf-cache
+              hostPath: { path: /home/user/hf-cache, type: Directory }
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 24Gi }
+            - name: kvbm-disk
+              hostPath: { path: /mnt/kvbm-disk, type: DirectoryOrCreate }
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["python3"]
+              args:
+                - -m
+                - dynamo.vllm
+                - --model
+                - nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+                - --served-model-name
+                - nemotron
+                - --trust-remote-code
+                - --load-format
+                - fastsafetensors
+                - --moe-backend
+                - cutlass
+                - --kv-cache-dtype
+                - fp8
+                - --mamba-ssm-cache-dtype
+                - bfloat16
+                - --mamba-cache-mode
+                - align
+                - --enable-chunked-prefill
+                - --enable-prefix-caching
+                # Required for Super with a KV connector. vLLM auto-disables
+                # the hybrid KV cache manager when --kv-transfer-config is set;
+                # Super then cannot unify Mamba + full-attention cache specs and
+                # dies before KVBM starts. If DynamoConnector does not support
+                # HMA, this flag will fail explicitly at connector setup.
+                - --no-disable-hybrid-kv-cache-manager
+                - --dyn-reasoning-parser
+                - nemotron_v3
+                - --dyn-tool-call-parser
+                - nemotron_nano
+                - --max-model-len
+                - "131072"
+                - --max-num-seqs
+                - "8"
+                - --max-num-batched-tokens
+                - "8447"
+                - --kv-cache-memory-bytes
+                - "4000000000"
+                - --gpu-memory-utilization
+                - "0.82"
+                - --kv-transfer-config
+                - '{"kv_connector":"DynamoConnector","kv_role":"kv_both","kv_connector_module_path":"kvbm.vllm_integration.connector"}'
+              env:
+                - name: DYN_KVBM_CPU_CACHE_GB
+                  value: "4"
+                - name: DYN_KVBM_DISK_CACHE_GB
+                  value: "200"
+                - name: DYN_KVBM_DISK_CACHE_DIR
+                  value: "/kvbm-disk"
+                - name: DYN_KVBM_METRICS
+                  value: "true"
+                - name: DYN_KVBM_METRICS_PORT
+                  value: "9600"
+                - name: DYN_KVBM_CACHE_STATS_LOG_INTERVAL_SECS
+                  value: "10"
+                - name: DYN_KVBM_DISABLE_DISK_OFFLOAD_FILTER
+                  value: "false"
+                # Keep this on by default. O_DIRECT failures on ext4 show up as
+                # EINVAL/write-all errors; the first smoke should test KVBM, not
+                # the filesystem's direct-IO alignment.
+                - name: DYN_KVBM_DISK_DISABLE_O_DIRECT
+                  value: "true"
+                - name: DYN_KVBM_NIXL_BACKEND_UCX
+                  value: "true"
+                - name: DYN_KVBM_NIXL_BACKEND_POSIX
+                  value: "true"
+                - name: UCX_NET_DEVICES
+                  value: "rocep1s0f1:1,roceP2p1s0f1:1"
+                - name: UCX_MAX_RNDV_RAILS
+                  value: "2"
+                - name: UCX_CM_USE_ALL_DEVICES
+                  value: "y"
+                - name: HF_HOME
+                  value: "/hf-cache"
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: VLLM_OMNI_USE_QUACK_FP8
+                  value: "0"
+                - name: PYTHONHASHSEED
+                  value: "42"
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK, SYS_RESOURCE]
+                runAsUser: 0
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                requests:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                  memory: 24Gi
+              volumeMounts:
+                - { name: hf-cache, mountPath: /hf-cache }
+                - { name: dshm, mountPath: /dev/shm }
+                - { name: kvbm-disk, mountPath: /kvbm-disk }
+              startupProbe:
+                httpGet: { path: /live, port: 9090 }
+                periodSeconds: 30
+                failureThreshold: 100

@@ -1,0 +1,356 @@
+# Super arms B and C: LMCache L1, with P2P switched on or off by env.
+#
+#   arm C   P2P_ENABLED=1   L1 plus cross-node sharing
+#   arm B   P2P_ENABLED=0   L1 alone, the control that separates "LMCache
+#                           helps" from "sharing between nodes helps"
+#
+# Structurally identical to nano-agg-p2p.yaml. Everything that differs is a
+# Super constant from docs/config.md or a consequence of Super's memory budget,
+# and each is commented where it appears.
+#
+# **The memory split, and why it is not Nano's split.**
+#
+# Nano gave arm A a 56 GB arena and arms B and C a 10 GB arena plus 48 GB of L1,
+# so both sides spent roughly the same total and the comparison asked where the
+# memory is best spent. Super keeps that principle and cannot keep the numbers.
+#
+#   device KV      5,549 B/token   measured 2026-08-19, two arena sizes
+#   LMCache L1    24,576 B/token   measured, and it tracks layer count exactly
+#   ratio                  4.43x
+#
+# Graph capture caps everything past the 74.8 GB of weights at about 20 GB on
+# the head node: 24 GB crash-looped and took etcd with it, 20 GB survived with a
+# 5 GB trough. So arms B and C get the same 20 GB total that arm A got, split
+# 8 GB arena plus 12 GB L1:
+#
+#   arm A   20 GB arena                    3.60M tokens
+#   arm B   8 GB arena + 12 GB L1    1.44M + 0.49M = 1.93M tokens
+#
+# **Arm B therefore starts with half the cache arm A has, for the same memory.**
+# That is not a flaw in the experiment, it is the measurement. On Nano the same
+# reallocation cost nothing because both sides sat above the knee of the reuse
+# curve. On Super the L1 tier is expensive enough that buying it costs real
+# capacity, and whether cross-node sharing repays that is what arm C answers.
+#
+# traces/reuse-distance.py puts arm A at 92.01% and 1.93M tokens at roughly
+# 90.8%, so the model expects arm B to read about a point below arm A before
+# P2P. Predictions on the record so the arms can falsify them.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  # Distinct from nano's `lmcache-worker-entrypoint`. Same namespace, and
+  # reusing the name would rewrite whichever arm was applied first.
+  name: super-lmcache-worker-entrypoint
+  namespace: dynamo-system
+data:
+  start.sh: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    ulimit -l unlimited
+    : "${NODE_IP:?downward API did not provide status.hostIP}"
+    P2P_ARGS=()
+    if [ "${P2P_ENABLED:-1}" = 1 ]; then
+      : "${COORDINATOR_URL:?P2P_ENABLED=1 requires COORDINATOR_URL}"
+      : "${P2P_PORT:?P2P_ENABLED=1 requires P2P_PORT}"
+      P2P_ARGS=(--p2p-advertise-url "${NODE_IP}:${P2P_PORT}"
+                --p2p-transfer-engine nixl
+                --coordinator-url "${COORDINATOR_URL}"
+                --coordinator-advertise-ip "${NODE_IP}")
+      echo "worker on ${NODE_IP}, P2P on, coordinator ${COORDINATOR_URL}"
+    else
+      echo "worker on ${NODE_IP}, P2P OFF, L1 only"
+    fi
+    L2_ARGS=()
+    STORE_ARGS=()
+    case "${L2_ADAPTER_MODE:-none}" in
+      none|"")
+        echo "worker on ${NODE_IP}, no explicit disk L2"
+        ;;
+      fs_native)
+        mkdir -p "${L2_PATH:?L2_PATH required for fs_native}"
+        L2_ARGS=(--l2-adapter "{\"type\":\"fs_native\",\"base_path\":\"${L2_PATH}\",\"num_workers\":${L2_NUM_WORKERS:-32},\"use_odirect\":${L2_USE_ODIRECT:-true},\"max_capacity_gb\":${L2_MAX_GB:-400}}")
+        echo "worker on ${NODE_IP}, local fs_native L2 at ${L2_PATH}, max ${L2_MAX_GB:-400} GB"
+        ;;
+      *)
+        echo "unknown L2_ADAPTER_MODE=${L2_ADAPTER_MODE}" >&2
+        exit 42
+        ;;
+    esac
+    if [ -n "${L2_STORE_POLICY:-}" ]; then
+      STORE_ARGS=(--l2-store-policy "${L2_STORE_POLICY}")
+      echo "worker on ${NODE_IP}, L2 store policy ${L2_STORE_POLICY}"
+    fi
+    lmcache server \
+      --host 0.0.0.0 --port 5555 \
+      --http-port 9500 \
+      --l1-size-gb "${L1_SIZE_GB}" \
+      --chunk-size "${CHUNK_SIZE}" \
+      --eviction-policy "${EVICTION_POLICY:-LRU}" \
+      --eviction-trigger-watermark "${EVICTION_WATERMARK:-0.8}" \
+      --eviction-ratio "${EVICTION_RATIO:-0.2}" \
+      --l2-prefetch-policy "${L2_PREFETCH_POLICY:-default}" \
+      --l2-prefetch-max-in-flight "${L2_PREFETCH_MAX_IN_FLIGHT:-8}" \
+      --instance-id "spark-${NODE_IP##*.}" \
+      "${P2P_ARGS[@]}" \
+      "${L2_ARGS[@]}" \
+      "${STORE_ARGS[@]}" &
+    for i in $(seq 60); do
+      (echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null && break
+      sleep 2
+    done
+    (echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null || {
+      echo "LMCACHE_START_FAIL: server never listened on 5555"; exit 41; }
+    exec python3 -m dynamo.vllm "$@"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lmcache-coordinator
+  namespace: dynamo-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: lmcache-coordinator }
+  template:
+    metadata:
+      labels: { app: lmcache-coordinator }
+    spec:
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/hostname: spark-a
+      containers:
+        - name: coordinator
+          image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+          imagePullPolicy: IfNotPresent
+          command: ["lmcache"]
+          args:
+            - coordinator
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "9300"
+            # **4224, not Nano's 2128.** The coordinator's chunk size must equal
+            # the servers' or peers agree on nothing and every lookup misses.
+            # Its default is 256 and it starts happily with the wrong value, so
+            # nothing warns you -- the arm just reads like P2P does not work.
+            - --chunk-size
+            - "4224"
+          ports:
+            - { name: http, containerPort: 9300 }
+          readinessProbe:
+            tcpSocket: { port: 9300 }
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: super-agg-p2p-frontend-ext
+  namespace: dynamo-system
+spec:
+  type: NodePort
+  selector:
+    nvidia.com/selector: super-agg-p2p-frontend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      # 30800 nano-agg-p2p, 30801 nano-agg-router, 30802 super-agg-router.
+      # Recorded in docs/config.md. The tunnel must be repointed per arm: a
+      # stale forward connects happily to the previous deployment and
+      # benchmarks the wrong model.
+      nodePort: 30803
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: super-agg-p2p
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  components:
+    - name: Frontend
+      type: frontend
+      replicas: 1
+      podTemplate:
+        spec:
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["python3"]
+              args:
+                - -m
+                - dynamo.frontend
+              env:
+                - name: DYN_ROUTER_MODE
+                  value: kv
+                - name: DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY
+                  value: "0.0"
+              ports:
+                - { name: http, containerPort: 8000 }
+              startupProbe:
+                httpGet: { path: /health, port: 8000 }
+                periodSeconds: 10
+                failureThreshold: 60
+    - name: VllmDecodeWorker
+      type: worker
+      replicas: 2
+      podTemplate:
+        spec:
+          hostNetwork: true
+          hostIPC: true
+          dnsPolicy: ClusterFirstWithHostNet
+          volumes:
+            - name: hf-cache
+              hostPath: { path: /home/user/hf-cache, type: Directory }
+            - name: entrypoint
+              configMap:
+                name: super-lmcache-worker-entrypoint
+                defaultMode: 0755
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 24Gi }
+            - name: l2disk
+              hostPath: { path: /mnt/lmcache-l2, type: DirectoryOrCreate }
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["/entrypoint/start.sh"]
+              args:
+                - --model
+                - nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+                - --served-model-name
+                - nemotron
+                - --trust-remote-code
+                - --load-format
+                - fastsafetensors
+                - --moe-backend
+                - cutlass
+                - --kv-cache-dtype
+                - fp8
+                - --mamba-ssm-cache-dtype
+                - bfloat16
+                # Required by LMCache 0.5.2, which refuses a hybrid without it.
+                # Forces the attention block up to the 4224 mamba page size.
+                - --mamba-cache-mode
+                - align
+                - --enable-chunked-prefill
+                - --enable-prefix-caching
+                - --dyn-reasoning-parser
+                - nemotron_v3
+                # Unverified for Super, same as the router-only manifest. If the
+                # worker dies early, check the log for a parser error before
+                # suspecting memory.
+                - --dyn-tool-call-parser
+                - nemotron_nano
+                - --max-model-len
+                - "131072"
+                - --max-num-seqs
+                - "32"
+                # block <= max_num_batched_tokens < 2 x block, and 4224 <= 8447
+                # < 8448 satisfies it. Identical to arm A.
+                - --max-num-batched-tokens
+                - "8447"
+                # 8 GB, 1.44M tokens at the measured 5,549 B/token. The other
+                # 12 GB of the 20 GB budget goes to L1 below.
+                - --kv-cache-memory-bytes
+                - "8000000000"
+                # Inert for arena sizing while kv-cache-memory-bytes is set --
+                # vLLM says so in the startup log and skips profiling entirely.
+                # Kept identical to arm A so the arms do not differ here.
+                - --gpu-memory-utilization
+                - "0.82"
+                - --kv-transfer-config
+                - '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}'
+              env:
+                - name: NODE_IP
+                  valueFrom:
+                    fieldRef: { fieldPath: status.hostIP }
+                # The RoCE address of spark-a, so coordinator traffic rides
+                # the ConnectX-7 rather than the LAN.
+                - name: COORDINATOR_URL
+                  value: http://10.1.0.11:9300
+                # Must match the coordinator's --chunk-size above.
+                - name: CHUNK_SIZE
+                  value: "4224"
+                # 12 GB, 0.49M tokens at 24,576 B/token. Small in absolute terms
+                # and that is the point: on Super the same gigabyte buys 4.43x
+                # fewer tokens here than in the arena.
+                #
+                # LMCache reserves this eagerly, so it competes with the ~9 GB
+                # CUDA graph capture transient rather than with steady-state
+                # headroom. 8 + 12 + 9 is already close to what the head node
+                # can give past the weights. If the workers crash-loop, lower
+                # this before touching the arena.
+                - name: L1_SIZE_GB
+                  value: "12"
+                # The arm switch. 1 for arm C, 0 for arm B.
+                - name: P2P_ENABLED
+                  value: "1"
+                - name: L2_PREFETCH_POLICY
+                  value: "default"
+                - name: L2_PREFETCH_MAX_IN_FLIGHT
+                  value: "8"
+                - name: L2_ADAPTER_MODE
+                  value: "none"
+                - name: L2_PATH
+                  value: "/l2disk"
+                - name: L2_NUM_WORKERS
+                  value: "32"
+                - name: L2_MAX_GB
+                  value: "400"
+                - name: L2_USE_ODIRECT
+                  value: "true"
+                - name: L2_STORE_POLICY
+                  value: ""
+                - name: EVICTION_POLICY
+                  value: "LRU"
+                # Matches weka-c-p2p. The eviction pair was shown on Nano to
+                # make no difference outside the 0.27-point noise floor, so it
+                # is held constant rather than swept again.
+                - name: EVICTION_RATIO
+                  value: "0.05"
+                - name: EVICTION_WATERMARK
+                  value: "0.95"
+                - name: P2P_PORT
+                  value: "9450"
+                - name: UCX_NET_DEVICES
+                  value: rocep1s0f1:1,roceP2p1s0f1:1
+                - name: UCX_MAX_RNDV_RAILS
+                  value: "2"
+                - name: UCX_CM_USE_ALL_DEVICES
+                  value: "y"
+                - name: HF_HOME
+                  value: /hf-cache
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: VLLM_OMNI_USE_QUACK_FP8
+                  value: "0"
+                - name: PYTHONHASHSEED
+                  value: "42"
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK, SYS_RESOURCE]
+                runAsUser: 0
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                requests:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                  memory: 24Gi
+              volumeMounts:
+                - { name: hf-cache, mountPath: /hf-cache }
+                - { name: entrypoint, mountPath: /entrypoint }
+                - { name: dshm, mountPath: /dev/shm }
+                - { name: l2disk, mountPath: /l2disk }
+              startupProbe:
+                httpGet: { path: /live, port: 9090 }
+                periodSeconds: 30
+                # 80 x 30 s. Super's 74.8 GB take about four times Nano's load
+                # time, and the LMCache server has to come up first.
+                failureThreshold: 80

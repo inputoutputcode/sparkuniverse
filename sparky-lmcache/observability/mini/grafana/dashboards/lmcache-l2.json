@@ -1,0 +1,634 @@
+{
+  "uid": "sparky-lmcache-l2",
+  "title": "Sparky LMCache L2",
+  "tags": [
+    "sparky",
+    "lmcache",
+    "l2"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "label": "node",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prom"
+        },
+        "query": "label_values(node_memory_MemAvailable_bytes, node)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "benchmark runs",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prom"
+        },
+        "enable": true,
+        "iconColor": "rgba(255, 96, 96, 1)",
+        "expr": "bench_run_info == 1",
+        "titleFormat": "run {{run_id}}",
+        "textFormat": "{{model}} / {{arm}} chunk={{chunk}} conc={{conc}}"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "L2 lookup hit rate",
+      "description": "Fraction of L2 lookup chunks that matched. This is the primary signal for whether disk L2 contains the requested cache chunks on the node that served the request.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.25
+              },
+              {
+                "color": "green",
+                "value": 0.6
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum by (node) (increase(lmcache_mp_l2_prefetch_hit_chunks_total{node=~\"$node\"}[$__range])) / sum by (node) (increase(lmcache_mp_l2_prefetch_lookup_objects_chunks_total{node=~\"$node\"}[$__range]))",
+          "refId": "A",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "L2 load success rate",
+      "description": "Loaded chunks divided by hit chunks. If this falls while hit rate is good, the L2 read path is finding chunks but failing to stage them.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.8
+              },
+              {
+                "color": "green",
+                "value": 0.95
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum by (node) (increase(lmcache_mp_l2_prefetch_load_submitted_objects_chunks_total{node=~\"$node\"}[$__range])) / sum by (node) (increase(lmcache_mp_l2_prefetch_hit_chunks_total{node=~\"$node\"}[$__range]))",
+          "refId": "A",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "L1 allocation failures",
+      "description": "Any increase here means LMCache could not allocate L1 staging space. This can block L2 prefetch even when L2 has the chunk.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "sum by (node) (increase(lmcache_mp_l1_allocation_failure_chunks_total{node=~\"$node\"}[$__range]))",
+          "refId": "A",
+          "legendFormat": "{{node}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "L2 lookup and hit chunks",
+      "description": "Lookup chunks are attempted L2 matches. Hit chunks are the subset found in L2.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (node) (rate(lmcache_mp_l2_prefetch_lookup_objects_chunks_total{node=~\"$node\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{node}} lookup",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        },
+        {
+          "expr": "sum by (node) (rate(lmcache_mp_l2_prefetch_hit_chunks_total{node=~\"$node\"}[5m]))",
+          "refId": "B",
+          "legendFormat": "{{node}} hit",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "L2 load and prefetch failures",
+      "description": "Loads are L2 hits submitted back toward L1/device. Failures indicate read-path problems after or during prefetch.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (node) (rate(lmcache_mp_l2_prefetch_load_submitted_objects_chunks_total{node=~\"$node\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{node}} load submitted",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        },
+        {
+          "expr": "sum by (node) (rate(lmcache_mp_l2_prefetch_failure_chunks_total{node=~\"$node\"}[5m]))",
+          "refId": "B",
+          "legendFormat": "{{node}} prefetch failures",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        },
+        {
+          "expr": "sum by (node) (rate(lmcache_mp_l1_allocation_failure_chunks_total{node=~\"$node\"}[5m]))",
+          "refId": "C",
+          "legendFormat": "{{node}} l1 alloc failures",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "L2 store pipeline",
+      "description": "Submitted and completed store chunks should track closely. A gap means L2 write backlog or loss.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (node) (rate(lmcache_mp_l2_store_submitted_objects_chunks_total{node=~\"$node\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{node}} submitted",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        },
+        {
+          "expr": "sum by (node) (rate(lmcache_mp_l2_store_completed_objects_chunks_total{node=~\"$node\"}[5m]))",
+          "refId": "B",
+          "legendFormat": "{{node}} completed",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache miss pressure",
+      "description": "Prefilled prompt tokens divided by received prompt tokens. Lower is better; a working L2 hit path should reduce this.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 3,
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (node) (rate(vllm:prompt_tokens_total{node=~\"$node\"}[5m]) - rate(vllm:prompt_tokens_cached_total{node=~\"$node\"}[5m])) / sum by (node) (rate(vllm:prompt_tokens_total{node=~\"$node\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{node}} miss ratio",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "L1 staging and churn",
+      "description": "L1 writes and evictions show staging pressure. With skip_l1/noop, persistent L1 growth should be limited while writes continue.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 21
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (node) (rate(lmcache_mp_l1_write_chunks_total{node=~\"$node\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "{{node}} l1 writes",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        },
+        {
+          "expr": "sum by (node) (rate(lmcache_mp_l1_evicted_chunks_total{node=~\"$node\"}[5m]))",
+          "refId": "B",
+          "legendFormat": "{{node}} l1 evictions",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "L1 and L2 bytes",
+      "description": "Current LMCache memory and disk-L2 usage.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 21
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "decimals": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "lmcache_mp_l1_memory_usage_bytes{node=~\"$node\"}",
+          "refId": "A",
+          "legendFormat": "{{node}} l1",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        },
+        {
+          "expr": "lmcache_mp_l2_usage_bytes{node=~\"$node\"}",
+          "refId": "B",
+          "legendFormat": "{{node}} l2 {{l2_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          }
+        }
+      ]
+    }
+  ]
+}

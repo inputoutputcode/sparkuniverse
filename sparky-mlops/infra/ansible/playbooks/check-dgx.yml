@@ -1,0 +1,36 @@
+- name: Check DGX Spark pre-requequisites
+  hosts: dgx
+  gather_facts: true
+
+  tasks:
+    - name: Check command exists
+      ansible.builtin.command: which sbatch
+      register: sbatch_check
+      changed_when: false
+      failed_when: false
+
+    - name: Report sbatch status
+      ansible.builtin.debug:
+        msg: "sbatch found: {{ sbatch_check.rc == 0 }}"
+
+    - name: Check srun exists
+      ansible.builtin.command: which srun
+      register: srun_check
+      changed_when: false
+      failed_when: false
+
+    - name: Report srun status
+      ansible.builtin.debug:
+        msg: "srun found: {{ srun_check.rc == 0 }}"
+
+    - name: Check k3s service
+      ansible.builtin.command: systemctl is-active k3s
+      register: k3s_status
+      changed_when: false
+      failed_when: false
+
+    - name: Check disk space
+      ansible.builtin.command: df -h /
+      register: disk_space
+      changed_when: false
+

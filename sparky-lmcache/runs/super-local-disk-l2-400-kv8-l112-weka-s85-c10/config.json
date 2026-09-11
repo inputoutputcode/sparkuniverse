@@ -1,0 +1,16 @@
+{
+  "run_id": "super-local-disk-l2-400-kv8-l112-weka-s85-c10",
+  "arm": "l2disk",
+  "model": "super",
+  "endpoint": "http://localhost:8000",
+  "trace": "cc-weka-s85-128k",
+  "trace_requests": 3485,
+  "requests_sent": 3485,
+  "dataset_type": "weka_trace",
+  "concurrency": 10,
+  "seed": 42,
+  "chunk_size": 4224,
+  "block_size": null,
+  "tokenizer": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+  "started": "2026-08-22T05:15:50Z"
+}

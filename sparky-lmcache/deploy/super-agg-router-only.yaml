@@ -1,0 +1,266 @@
+# Super arm A: KV-aware routing, no LMCache. The baseline for super-agg-p2p.yaml.
+#
+# Structurally identical to nano-agg-router-only.yaml. Everything that differs
+# is either a Super constant from docs/config.md or a consequence of Super's
+# 74.8 GB of weights, and each one is commented where it appears.
+#
+# **Why Super is the interesting case, and why this arm is not Nano's arm A.**
+#
+# On Nano, arm A got a 56 GB arena that held the entire 12.59M-token working
+# set, and it tied arm B to within the noise floor: local KV offload bought
+# nothing that device memory could not buy more cheaply. That result depends
+# entirely on there being spare memory to give.
+#
+# Super has none. 74.8 GB of weights against roughly 121 GB usable leaves about
+# 46 GB before activations, and the same working set needs an estimated 73 GB of
+# device arena. This arm is oversubscribed by construction and cannot be rescued
+# by raising a number. That asymmetry is the finding, not a limitation of the
+# experiment.
+#
+# Run it the same way as the Nano arms, same trace, same concurrency:
+#   RUN_ID=super-a-router ARM=router MODEL=super ENDPOINT=http://localhost:8000 \
+#     TRACE=../traces/data/cc-weka-s85-128k/ CONCURRENCY=10 ./run-scenario.sh
+#
+# **Before applying this, the HF cache must be seeded on both nodes** or each
+# worker tries to pull 74.8 GB from the hub:
+#   REPO_ID=nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
+#     SRC=$HOME/models/nemotron-3-super-120b-nvfp4 ~/seed-hf-cache.sh
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  # Distinct name from the Nano manifest's ConfigMap. They share a namespace,
+  # and reusing `router-only-worker-entrypoint` would silently rewrite the
+  # entrypoint of whichever arm was applied first.
+  name: super-router-only-worker-entrypoint
+  namespace: dynamo-system
+data:
+  start.sh: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    ulimit -l unlimited
+    : "${NODE_IP:?downward API did not provide status.hostIP}"
+    echo "router-only Super worker on ${NODE_IP}, no LMCache"
+    exec python3 -m dynamo.vllm "$@"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: super-agg-router-frontend-ext
+  namespace: dynamo-system
+spec:
+  type: NodePort
+  selector:
+    nvidia.com/selector: super-agg-router-frontend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      # 30800 is the Nano P2P arm, 30801 the Nano router-only arm. A duplicate
+      # here would be rejected at apply time, but worse, an ssh tunnel pointed
+      # at the wrong one connects happily and benchmarks the other model. That
+      # cost an evening on 2026-08-18. Record it in docs/config.md.
+      nodePort: 30802
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: super-agg-router
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  components:
+    - name: Frontend
+      type: frontend
+      replicas: 1
+      podTemplate:
+        spec:
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["python3"]
+              args:
+                - -m
+                - dynamo.frontend
+              env:
+                - name: DYN_ROUTER_MODE
+                  value: kv
+                - name: DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY
+                  value: "0.0"
+              ports:
+                - { name: http, containerPort: 8000 }
+              startupProbe:
+                httpGet: { path: /health, port: 8000 }
+                periodSeconds: 10
+                # 60 x 10 s was sized for Nano. The frontend itself does not
+                # load weights, but it resolves the tokenizer against the hub
+                # and will not answer /health until it has, so this stays.
+                failureThreshold: 60
+
+    - name: VllmDecodeWorker
+      type: worker
+      replicas: 2
+      podTemplate:
+        spec:
+          hostNetwork: true
+          hostIPC: true
+          dnsPolicy: ClusterFirstWithHostNet
+          volumes:
+            - name: hf-cache
+              hostPath: { path: /home/user/hf-cache, type: Directory }
+            - name: entrypoint
+              configMap:
+                name: super-router-only-worker-entrypoint
+                defaultMode: 0755
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 24Gi }
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["/entrypoint/start.sh"]
+              args:
+                - --model
+                - nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+                - --served-model-name
+                - nemotron
+                - --trust-remote-code
+                - --load-format
+                - fastsafetensors
+                - --moe-backend
+                - cutlass
+                - --kv-cache-dtype
+                - fp8
+                - --mamba-ssm-cache-dtype
+                - bfloat16
+                # Still required. LMCache 0.5.2 refuses a hybrid without it, and
+                # although this arm runs no LMCache, changing it would make the
+                # arms differ in the attention block size as well as in LMCache.
+                - --mamba-cache-mode
+                - align
+                - --enable-chunked-prefill
+                - --enable-prefix-caching
+                - --dyn-reasoning-parser
+                - nemotron_v3
+                # UNVERIFIED FOR SUPER. This parser name was chosen for Nano. It
+                # affects response postprocessing rather than token generation,
+                # and the benchmark runs with ignore_eos so output lengths are
+                # fixed either way, but an unknown parser name may be rejected
+                # at startup. If the worker dies early, check the log for a
+                # parser error before suspecting memory.
+                - --dyn-tool-call-parser
+                - nemotron_nano
+                - --max-model-len
+                - "131072"
+                - --max-num-seqs
+                - "32"
+                # Super constant. block <= max_num_batched_tokens < 2 x block,
+                # and 8447 satisfies it for the 4224 attention block that
+                # --mamba-cache-mode align forces.
+                - --max-num-batched-tokens
+                - "8447"
+                # 20 GB, and the constraint that sets it is not steady state.
+                #
+                # **Super's device cost is 5,549 B/token, measured**, from
+                # 16,000,000,000 / 2,883,584 tokens on the 2026-08-19 deploy.
+                # That replaces the 5,780 estimate the docs carried, which was
+                # Nano's measured 3,492 scaled by KV-bearing layers, 48 against
+                # 29. The layer ratio is 1.655 and the true ratio is 1.589, so
+                # scaling was close but not a substitute for measuring.
+                #
+                # 20 GB is therefore about 3.60M tokens, 28.6% of the
+                # 12,593,600-token working set. Oversubscribed by a factor of
+                # three and a half, which is the regime the P2P arms exist to
+                # test and cannot be tuned away on this hardware.
+                #
+                # **The binding constraint is CUDA graph capture, not serving.**
+                # Because kv_cache_memory_bytes is set, vLLM skips its memory
+                # profiling pass entirely and reserves this figure directly. The
+                # arena is then allocated and graph capture runs on whatever is
+                # left, taking roughly 8 to 9 GB transiently and releasing it
+                # again -- the log reports `Graph capturing finished in 7 secs,
+                # took -6.61 GiB`. At 16 GB the trough was 9 GB free; at 20 GB
+                # expect about 5 GB. At 24 GB the first deploy crash-looped, and
+                # this is why.
+                #
+                # **Do not raise this above 22 GB on spark-a.** The head node
+                # runs the k3s control plane on top of its worker and reports
+                # `Initial free memory 112.34 GiB` against spark-b's
+                # `114.9 GiB`. An OOM there takes etcd and nats down with the
+                # worker, which is what happened on the first attempt. Both
+                # workers must be configured identically for the arms to be
+                # comparable, so the head node sets the ceiling for both.
+                - --kv-cache-memory-bytes
+                - "20000000000"
+                # **This flag is inert while kv_cache_memory_bytes is set, and
+                # the earlier comments here claiming otherwise were wrong.**
+                #
+                # vLLM says so directly:
+                #   reserved 14.9 GiB memory for KV Cache as specified by
+                #   kv_cache_memory_bytes config and skipped memory profiling.
+                #   This does not respect the gpu_memory_utilization config.
+                #
+                # So the first crash was not fixed by lowering this from 0.88 to
+                # 0.82, which is what the previous revision of this comment
+                # claimed. It was fixed by lowering the arena from 24 GB. The
+                # same wrong claim is in nano-agg-router-only.yaml and
+                # nano-agg-p2p.yaml and needs correcting there.
+                #
+                # Kept at 0.82 rather than removed, because it still bounds the
+                # allocator for everything that is not the KV arena, and because
+                # changing it now would be a second variable against a deploy
+                # that has already been verified. Do not reach for it to tune
+                # the cache -- the arena flag is the only lever that moves.
+                #
+                # Verify after deploy, do not assume:
+                #   grep -i "GPU KV cache size" in the worker log.
+                # At the measured 5,549 B/token, a 20 GB arena is 3.60M tokens.
+                # Anything materially below that means the flag did not take.
+                - --gpu-memory-utilization
+                - "0.82"
+                # No --kv-transfer-config. This is the arm.
+              env:
+                - name: NODE_IP
+                  valueFrom:
+                    fieldRef: { fieldPath: status.hostIP }
+                - name: UCX_NET_DEVICES
+                  value: rocep1s0f1:1,roceP2p1s0f1:1
+                - name: UCX_MAX_RNDV_RAILS
+                  value: "2"
+                - name: UCX_CM_USE_ALL_DEVICES
+                  value: "y"
+                - name: HF_HOME
+                  value: /hf-cache
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: VLLM_OMNI_USE_QUACK_FP8
+                  value: "0"
+                - name: PYTHONHASHSEED
+                  value: "42"
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK, SYS_RESOURCE]
+                runAsUser: 0
+              resources:
+                limits:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                requests:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                  memory: 24Gi
+              volumeMounts:
+                - { name: hf-cache, mountPath: /hf-cache }
+                - { name: entrypoint, mountPath: /entrypoint }
+                - { name: dshm, mountPath: /dev/shm }
+              startupProbe:
+                httpGet: { path: /live, port: 9090 }
+                periodSeconds: 30
+                # 40 x 30 s was sized for Nano's 19 GB of weights, which take
+                # about 130 s. Super loads 74.8 GB from the same local cache, so
+                # roughly four times as long. 80 gives 40 minutes and costs
+                # nothing when startup is fast.
+                failureThreshold: 80

@@ -1,0 +1,85 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  external_labels:
+    cluster: spark-pair
+
+# A permanently-down target is worse than no target: it looks identical to an
+# idle one on a dashboard. Everything here was verified reachable against the
+# k3s deployment on 2026-08-15. If you add a job, curl it first.
+
+scrape_configs:
+
+  # ---- hardware -----------------------------------------------------------
+  # The Mac Mini is not scraped. It runs no node_exporter, and the job sat
+  # down against host.docker.internal for days.
+  - job_name: node
+    static_configs:
+      - targets: ["10.0.0.11:9100"]
+        labels: {node: spark-a}
+      - targets: ["10.0.0.12:9100"]
+        labels: {node: spark-b}
+
+  - job_name: dcgm
+    static_configs:
+      - targets: ["10.0.0.11:9400"]
+        labels: {node: spark-a}
+      - targets: ["10.0.0.12:9400"]
+        labels: {node: spark-b}
+
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["10.0.0.11:8080"]
+        labels: {node: spark-a}
+      - targets: ["10.0.0.12:8080"]
+        labels: {node: spark-b}
+
+  # ---- workload -----------------------------------------------------------
+  # Dynamo workers under k3s. hostNetwork: true, so 9090 is on the host, not a
+  # pod IP. Exposes dynamo_component_* and dynamo_work_handler_*: inflight
+  # requests, queue depth, gpu_cache_usage_percent, total_blocks, and the
+  # network-transit histogram that separates queueing from compute.
+  - job_name: dynamo-worker
+    static_configs:
+      - targets: ["10.0.0.11:9090"]
+        labels: {node: spark-a}
+      - targets: ["10.0.0.12:9090"]
+        labels: {node: spark-b}
+
+  # Bare-docker vLLM, used by bench/p2p-validate.sh and cache-correctness.sh
+  # outside Kubernetes. Down between runs, by design.
+  - job_name: vllm-standalone
+    static_configs:
+      - targets: ["10.0.0.11:8011"]
+        labels: {node: spark-a}
+      - targets: ["10.0.0.12:8011"]
+        labels: {node: spark-b}
+
+  # ---- dynamo frontend ----------------------------------------------------
+  # The operator gives the frontend a ClusterIP, which is unreachable from the
+  # Mac Mini. deploy/nano-agg-p2p.yaml adds a NodePort on 30800 for this and
+  # for AIPerf's endpoint.
+  - job_name: dynamo-frontend
+    static_configs:
+      - targets: ["10.0.0.11:30800"]
+        labels: {node: spark-a}
+
+  # ---- lmcache ------------------------------------------------------------
+  # 27 series per node, confirmed live. The ones that matter here:
+  #   lmcache_mp_lookup_hit_tokens_total / _requested_tokens_total  reuse rate
+  #   lmcache_mp_l2_prefetch_hit_chunks_total                       peer hits
+  #   lmcache_mp_l1_usage_ratio                                     0.80 evict
+  #   lmcache_mp_active_p2p_lookup_jobs                             in flight
+  #   lmcache_mp_event_bus_dropped_events_total                     lost truth
+  - job_name: lmcache
+    static_configs:
+      - targets: ["10.0.0.11:9500"]
+        labels: {node: spark-a}
+      - targets: ["10.0.0.12:9500"]
+        labels: {node: spark-b}
+
+  # ---- not scraped, and why ----------------------------------------------
+  # etcd (2381) and NATS (7777) run as ClusterIP services inside k3s and are
+  # not reachable from here. Router state does flow through them, so a stalled
+  # etcd can look like a router bug. Add NodePorts if that ever needs ruling
+  # out; until then an always-down target teaches nothing.

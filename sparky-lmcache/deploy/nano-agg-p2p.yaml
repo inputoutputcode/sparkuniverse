@@ -1,0 +1,535 @@
+# Aggregated Nemotron 3 Nano on two DGX Sparks, with LMCache P2P over RoCE.
+#
+# Every constant here was measured. See docs/findings.md.
+#   chunk size 2128        forced by the mamba page size on Nano with align mode
+#   batched tokens 4255    LMCache requires block <= value < 2 x block
+#   align mode             LMCache 0.5.2 refuses a hybrid without it
+#   host IPC + one container   the connector reaches the server over
+#                              tcp://localhost:5555 and shared memory
+#   --host 0.0.0.0         peer lookup targets ZMQ 5555 at the advertised IP,
+#                          and the default binds localhost, so lookups time out
+#   p2p port 9450          9400 is dcgm-exporter, 9500 is lmcache's own metrics
+#
+# Super: chunk 4224, batched tokens 8447, util 0.72, and a larger L1.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lmcache-worker-entrypoint
+  namespace: dynamo-system
+data:
+  # LMCache server and vLLM run in ONE container. Two containers in a pod do
+  # not share an IPC namespace, and the connector needs shared memory as well
+  # as the socket. hostIPC alone would not fix the ordering.
+  start.sh: |
+    #!/usr/bin/env bash
+    set -Eeuo pipefail
+    ulimit -l unlimited
+
+    : "${NODE_IP:?downward API did not provide status.hostIP}"
+
+    # Arm B (L1 only) and arm C (L1 plus P2P) differ in exactly one variable.
+    # Two manifests would drift, and a four-arm comparison where the arms differ
+    # in something nobody noticed is worse than no comparison at all.
+    P2P_ARGS=()
+    if [ "${P2P_ENABLED:-1}" = 1 ]; then
+      : "${COORDINATOR_URL:?P2P_ENABLED=1 requires COORDINATOR_URL}"
+      : "${P2P_PORT:?P2P_ENABLED=1 requires P2P_PORT}"
+      P2P_ARGS=(--p2p-advertise-url "${NODE_IP}:${P2P_PORT}"
+                --p2p-transfer-engine nixl
+                --coordinator-url "${COORDINATOR_URL}"
+                --coordinator-advertise-ip "${NODE_IP}")
+      echo "worker on ${NODE_IP}, P2P on, coordinator ${COORDINATOR_URL}"
+    else
+      # No coordinator either. Leaving one running with no peers registering
+      # produces registration noise that reads as a fault later.
+      echo "worker on ${NODE_IP}, P2P OFF, L1 only"
+    fi
+
+    lmcache server \
+      --host 0.0.0.0 --port 5555 \
+      --http-port 9500 \
+      --l1-size-gb "${L1_SIZE_GB}" \
+      --chunk-size "${CHUNK_SIZE}" \
+      --eviction-policy LRU \
+      --eviction-trigger-watermark "${EVICTION_WATERMARK:-0.8}" \
+      --eviction-ratio "${EVICTION_RATIO:-0.2}" \
+      --l2-prefetch-policy "${L2_PREFETCH_POLICY:-default}" \
+      --instance-id "spark-${NODE_IP##*.}" \
+      "${P2P_ARGS[@]}" &
+
+    for i in $(seq 60); do
+      (echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null && break
+      sleep 2
+    done
+    (echo > /dev/tcp/127.0.0.1/5555) 2>/dev/null || {
+      echo "LMCACHE_START_FAIL: server never listened on 5555"; exit 41; }
+
+    exec python3 -m dynamo.vllm "$@"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lmcache-coordinator
+  namespace: dynamo-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: lmcache-coordinator }
+  template:
+    metadata:
+      labels: { app: lmcache-coordinator }
+    spec:
+      # Host network so the workers, which are also host network, reach it at
+      # a fabric address rather than a pod IP.
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/hostname: spark-a
+      containers:
+        - name: coordinator
+          image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+          imagePullPolicy: IfNotPresent
+          command: ["lmcache"]
+          args:
+            - coordinator
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "9300"
+            # Must equal the servers'. Its own default is 256, and a mismatch
+            # means peers agree on nothing.
+            - --chunk-size
+            - "2128"
+          ports:
+            - { name: http, containerPort: 9300 }
+          readinessProbe:
+            tcpSocket: { port: 9300 }
+            periodSeconds: 5
+---
+# The operator gives the frontend a ClusterIP, which only a node can reach.
+# Both AIPerf and Prometheus run on the Mac Mini, so they need a stable
+# address. A NodePort is the smallest thing that provides one, and it survives
+# frontend pod replacement, which a port-forward does not.
+#
+# Selector taken from the pod's own labels, not guessed:
+#   nvidia.com/selector=nano-agg-p2p-frontend
+apiVersion: v1
+kind: Service
+metadata:
+  name: nano-agg-p2p-frontend-ext
+  namespace: dynamo-system
+spec:
+  type: NodePort
+  selector:
+    nvidia.com/selector: nano-agg-p2p-frontend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      nodePort: 30800
+---
+apiVersion: nvidia.com/v1beta1
+kind: DynamoGraphDeployment
+metadata:
+  name: nano-agg-p2p
+  namespace: dynamo-system
+spec:
+  backendFramework: vllm
+  components:
+    - name: Frontend
+      type: frontend
+      replicas: 1
+      # Nothing mounted here, and nothing can be. The operator's frontend
+      # defaulter rewrites `type: frontend` components and drops volumes,
+      # volumeMounts and compilationCache. Verified against the stored
+      # resource: the worker keeps all four of its volumes, the frontend keeps
+      # none, and `volumes` is legal in the schema for both. The same rewrite
+      # appends --router-mode, --http-host and --http-port to args below.
+      #
+      # The frontend is Dynamo's preprocessor -- the card says
+      # "model_input": "Tokens" -- so it needs tokenizer.json and config.json
+      # regardless of router mode. It gets them from the hub, ~18 MB, because
+      # the workers advertise a repo id. See seed-hf-cache.sh.
+      podTemplate:
+        spec:
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              # Keep this minimal. The operator supplies the frontend's own
+              # arguments, including the Dynamo namespace the workers register
+              # under. Overriding --router-mode, --http-host and --http-port
+              # produced a frontend that saw endpoints but listed no models.
+              # Routing goes through env, as in NVIDIA's own recipes.
+              command: ["python3"]
+              args:
+                - -m
+                - dynamo.frontend
+              env:
+                - name: DYN_ROUTER_MODE
+                  value: kv
+                # Parked at the stock default. Decay withdraws a worker's
+                # cache-locality credit as its active prefill load rises above
+                # the least-loaded worker, which sounds like the fix for the
+                # 26/22 split seen at concurrency 5 -- but that split was five
+                # requests failing to fill ten slots, not the router hoarding.
+                # At concurrency 10 the stock router balanced 153/154 with
+                # decay still at 0.
+                #
+                # Kept here as an explicit knob because it is the deterministic
+                # way to force placement away from a cached prefix, unlike
+                # --router-temperature which does it by softmax sampling. If a
+                # sweep is run, every value needs the same value in the
+                # router-only arm, or the comparison measures the tuning.
+                - name: DYN_ROUTER_KV_OVERLAP_SCORE_CREDIT_DECAY
+                  value: "0.0"
+              ports:
+                - { name: http, containerPort: 8000 }
+              startupProbe:
+                httpGet: { path: /health, port: 8000 }
+                periodSeconds: 10
+                failureThreshold: 60
+
+    - name: VllmDecodeWorker
+      type: worker
+      replicas: 2
+      podTemplate:
+        spec:
+          # No topologySpreadConstraints. Grove owns placement and its
+          # validating webhook rejects them outright:
+          #   spec.template.cliques[1].spec.podSpec.spec.topologySpreadConstraints:
+          #   must not be set
+          #
+          # They were redundant anyway. Each worker requests one GPU and each
+          # node advertises exactly one, so two replicas cannot share a Spark.
+          # The GPU limit does the spreading.
+          hostNetwork: true
+          hostIPC: true
+          dnsPolicy: ClusterFirstWithHostNet
+          volumes:
+            # A HuggingFace cache built by seed-hf-cache.sh from the model
+            # directory already on disk. Hard links, so the 19 GB is not
+            # duplicated. This is what lets --model be a repo id without
+            # downloading anything: the worker resolves it offline from here,
+            # and the card it registers carries the repo id, which the frontend
+            # can actually resolve.
+            - name: hf-cache
+              hostPath: { path: /home/user/hf-cache, type: Directory }
+            - name: entrypoint
+              configMap:
+                name: lmcache-worker-entrypoint
+                defaultMode: 0755
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 24Gi }
+            # No /dev/infiniband hostPath. Mounting it makes the device nodes
+            # visible but not usable: the device cgroup still denies open(),
+            #   [Errno 1] Operation not permitted: '/dev/infiniband/uverbs0'
+            # and UCX then falls back to TCP without saying so. The RDMA shared
+            # device plugin injects the same devices *and* the cgroup entry.
+          containers:
+            - name: main
+              image: dynamo-vllm-lmcache:1.3.0-lmc052-arm64
+              imagePullPolicy: IfNotPresent
+              command: ["/entrypoint/start.sh"]
+              args:
+                # A repo id, not a path. The model card copies this verbatim,
+                # and the frontend must be able to resolve it. Weights still
+                # come off local disk via the seeded cache and HF_HUB_OFFLINE.
+                - --model
+                - nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+                - --served-model-name
+                - nemotron
+                - --trust-remote-code
+                - --load-format
+                - fastsafetensors
+                - --moe-backend
+                - cutlass
+                - --kv-cache-dtype
+                - fp8
+                - --mamba-ssm-cache-dtype
+                - bfloat16
+                - --mamba-cache-mode
+                - align
+                - --enable-chunked-prefill
+                - --enable-prefix-caching
+                # Without these the model's reasoning trace is returned as the
+                # answer. A "say hi" round trip came back with
+                #   Okay, the user just said "say hi". That's super simple...
+                # which any agent client will treat as the response. The
+                # parsers split it into reasoning_content and tool_calls.
+                #
+                # These are the Dynamo-side flags, not vLLM's. The frontend is
+                # the postprocessor here -- the card says
+                # "model_input": "Tokens" -- so vLLM's --reasoning-parser and
+                # --reasoning-parser-plugin never run, even though the model
+                # directory ships nano_v3_reasoning_parser.py registering
+                # "nano_v3". The values below appear in the model card's
+                # runtime_config, where the frontend reads them.
+                #
+                # Verify after a restart, do not assume: a chat completion
+                # should return reasoning_content separately from content.
+                - --dyn-reasoning-parser
+                - nemotron_v3
+                - --dyn-tool-call-parser
+                - nemotron_nano
+                # No --enable-prompt-tokens-details here. That is a
+                # `vllm serve` flag and dynamo.vllm rejects it. Reuse is
+                # measured from LMCache metrics and vLLM's prefix cache
+                # counters instead, see the README.
+                - --max-model-len
+                - "131072"
+                # 32 for the concurrency knee. At 5 the pair has ten execution
+                # slots, so a sweep past c10 measures the manifest rather than
+                # the machine -- aggregate throughput would flatten at exactly
+                # 10 whatever the hardware could do.
+                #
+                # Device floor at this value: 32 x 131,072 x 3,492 = 14.6 GB,
+                # above the 10 GB arena, so preemption is possible if many
+                # sessions run at full depth. Watch num_preemptions_total; it
+                # must stay at zero or the run recomputes work it already did.
+                #
+                # Set back to 5 for the #23 arms if the knee lands below it.
+                - --max-num-seqs
+                - "32"
+                - --max-num-batched-tokens
+                - "4255"
+                # Pinned in bytes, not as a fraction. At util 0.40 the two
+                # nodes sized their arenas at 26.37 and 26.35 GiB and reported
+                # 8,107,739 / 8,103,994 tokens, and successive restarts on one
+                # node gave 4307 / 4313 / 4328 blocks -- the fraction is taken
+                # of whatever unified memory happened to be free at init, so
+                # capacity drifts with whatever else the box was doing.
+                # Comparing benchmark arms at different capacities leaves a
+                # confound that cannot be subtracted out afterwards.
+                #
+                # 26 GiB, below both observed arenas: a value equal to the best
+                # case fails to allocate on a bad boot instead of shrinking.
+                # kv_cache_memory_bytes overrides gpu_memory_utilization when
+                # set, per the flag's own help text. Exact bytes rather than
+                # '26G', because the parser uses decimal multipliers.
+                # 10 GB -> ~2.86M tokens at the measured 3,492 B/token.
+                #
+                # Not the largest arena that fits. Nano's weights are 19 GB, so
+                # 26 GiB of device KV is available and holds 8.0M tokens --
+                # twelve times what the 12 GiB L1 below it could hold. A tier
+                # backed by something smaller than itself is not a hierarchy,
+                # and no trace can demonstrate one.
+                #
+                # Super has no such luxury: 74.8 GB of weights leave ~17 GB for
+                # device KV and ~28 GB for L1, about 2.9M and 0.91M tokens.
+                # These values give Nano the same *token* capacities, so the
+                # same trace applies the same pressure to both models and the
+                # comparison is about the model, not the memory left over.
+                #
+                # The scenario this represents is a Spark with less memory
+                # free -- another model resident, or a smaller machine. Say so
+                # when reporting: this is Nano under Super-like memory
+                # pressure, not Nano as it would be deployed alone.
+                #
+                # Floor check: 5 concurrent sequences at the trace's 123k-token
+                # cap need 615k tokens resident, well inside 2.86M. Below that
+                # you get reason="capacity" waits and preemption, and
+                # preemption recomputes work already done.
+                - --kv-cache-memory-bytes
+                - "10000000000"
+                # 0.28, down from 0.40, and it is a gate rather than a size.
+                #
+                # The entrypoint starts the LMCache server and waits for port
+                # 5555 before exec'ing dynamo.vllm, so L1 is already reserved
+                # when vLLM starts, and unified memory means it comes out of the
+                # same pool. vLLM then checks free memory against
+                # gpu_memory_utilization x TOTAL, not against what it needs:
+                #   ValueError: Free memory on device cuda:0 (37.38/121.69 GiB)
+                #   on startup is less than desired GPU memory utilization
+                #   (0.4, 48.68 GiB).
+                # Both workers CrashLoopBackOff on 2026-08-17 at L1 = 72.
+                #
+                # kv_cache_memory_bytes pins the arena at 10 GB regardless, so
+                # the fraction only has to clear what vLLM genuinely uses:
+                # weights 17.7 GiB + arena 9.31 + activations ~4 = ~31 GiB.
+                # 0.28 x 121.69 = 34.07 GiB, leaving 3.3 GiB inside vLLM's own
+                # budget and 6.4 GiB of real memory unclaimed.
+                #
+                # Back to 0.40 with L1 at 48. Lowering it to 0.28 to fit a
+                # 72 GiB L1 only deferred the failure past weight loading, so
+                # the gate was doing useful work. Keep them in step: at 0.40 the
+                # L1 ceiling is about 60 GiB.
+                - --gpu-memory-utilization
+                - "0.40"
+                - --kv-transfer-config
+                - '{"kv_connector":"LMCacheMPConnector","kv_role":"kv_both"}'
+              env:
+                - name: NODE_IP
+                  valueFrom:
+                    fieldRef: { fieldPath: status.hostIP }
+                - name: COORDINATOR_URL
+                  value: http://10.1.0.11:9300
+                - name: CHUNK_SIZE
+                  value: "2128"
+                # 48 GiB for the L1 sizing experiment. See docs/exp-l1-sizing.md.
+                #
+                # Was 17, chosen to match Super's ~0.91M usable tokens. At that
+                # size the two nodes' L1 together held 28.7% of the agent-1000
+                # working set and the measured peer hit rate was 29.94% -- the
+                # peer holds about what it has room to hold, and usage_ratio sat
+                # on the 0.80 eviction watermark.
+                #
+                # 48 GiB is 0.8 x 51.5 GB / 14,848 = ~2.78M tokens per node,
+                # 81.2% of the working set across the pair. If capacity is the
+                # binding constraint the peer hit rate should follow.
+                #
+                # The device arena stays at 10 GB. One variable.
+                # 64 GiB, the measured ceiling on this box. `free` with the
+                # 48 GiB deployment up reported 121 GB total, 91 used, 29
+                # available on the tighter node, which carries the k3s server
+                # and the coordinator. 64 GiB is 68.7 GB and leaves 11.8 GB
+                # free. 72 would leave 3.2 GB and risks an OOM mid-run.
+                #
+                # At 64 GiB L1 holds 3,702,053 tokens per node against the
+                # device arena's 2,862,986, so for the first time the tier below
+                # is larger than the tier above. Both nodes together cover 59%
+                # of the cc-weka-s85 working set, so it stays oversubscribed.
+                # 48. Back from 72, which failed twice on 2026-08-17.
+                #
+                # At util 0.40 it never started: the free-memory gate rejected
+                # it. At util 0.28 it cleared the gate, loaded weights, and the
+                # EngineCore subprocess was then killed while allocating the
+                # arena, leaving no traceback and `Failed core proc(s): {}`.
+                # Lowering the gate did not create memory, it moved the failure
+                # later.
+                #
+                # The arena is reserved without being faulted in: `free` showed
+                # 79 GB used with only the LMCache server running, against 77.3
+                # GB for the reservation alone. Memory is committed as the cache
+                # fills, so surviving startup does not prove surviving a run.
+                # 48 is the only value with that proof, from the l1-48 arm.
+                #
+                # Raising this is a separate experiment with its own baseline,
+                # not something to fold into the A/B/C comparison.
+                - name: L1_SIZE_GB
+                  value: "48"
+                # Arm C sets 1, arm B sets 0. The only difference between them.
+                - name: P2P_ENABLED
+                  value: "1"
+                # `default` deletes a peer-fetched chunk once the reader
+                # finishes. `retain` keeps it in L1 permanently.
+                #
+                # Measured on `default`: 76% of L1 writes were peer content that
+                # did not stay, l1_evicted_chunks_total tracked
+                # l2_prefetch_load_submitted to the unit, and only locally
+                # computed chunks remained resident.
+                #
+                # Which is better is not obvious and is worth an arm. Discarding
+                # keeps the two caches disjoint, so the pair covers 44% of the
+                # cc-weka-s85 working set. Retaining converges both nodes on the
+                # same hot content and coverage falls toward 22%, in exchange
+                # for not re-fetching. A re-fetch is 38 ms for 474 MB over the
+                # fabric against 4.69 s to recompute, so on this interconnect
+                # discarding looks right. On 1 GbE the re-fetch is 4.06 s and
+                # the answer flips.
+                #
+                # Keep `default` for arms A through D. It is what an operator
+                # gets without knowing the flag exists.
+                - name: L2_PREFETCH_POLICY
+                  value: "default"
+                # Eviction frees this fraction of L1 *capacity* per cycle, not
+                # of what is currently allocated, whatever the docs' wording
+                # suggests. Measured on spark-a: usage peaked at 0.7994,
+                # 41.2 GB, and dropped to 30.8 GB. That is 10.4 GB, which is
+                # 20.2% of the 51.54 GB arena and 25% of what was allocated.
+                #
+                # So L1 sawtooths between 0.60 and 0.80 rather than sitting at
+                # 0.80, and mean usable capacity is 0.70 of the arena. Every
+                # sizing figure in docs/findings.md computed at 0.8 is about
+                # 12.5% optimistic.
+                #
+                # 0.05 would give a 0.75 to 0.80 sawtooth, recovering most of
+                # that for no memory and no risk to the startup gate. It costs
+                # more frequent cycles rather than deeper ones: 82 chunks freed
+                # per cycle against 326, at a net fill rate near 16 chunks per
+                # minute.
+                #
+                # 0.05 with a 0.95 watermark. Together these set the usable
+                # band, so they move together rather than being two variables.
+                #
+                #   0.8 / 0.2   band 0.60 to 0.80, mean 0.70, 2,429,615 tok/node
+                #   0.95 / 0.05 band 0.90 to 0.95, mean 0.925, 3,210,563 tok/node
+                #
+                # +32% usable L1 for no extra memory, and it cannot trip the
+                # --gpu-memory-utilization startup gate that killed two deploys,
+                # because the reservation does not change.
+                #
+                # The cost is headroom: 0.05 of 51.54 GB is 2.58 GB, about 82
+                # chunks, against 326 at the old setting. The evictor has to
+                # react faster. Net fill is near 16 chunks/min so a cycle every
+                # ~5 minutes should hold, but this is the setting to suspect if
+                # stores start failing or usage overshoots 0.95.
+                #
+                # Every LMCache arm must use the same pair. Arm A has no
+                # LMCache and is unaffected.
+                # 0.95 / 0.05, against arm C at 0.8 / 0.2 which is complete:
+                # 92.00% cache read, 94.30% ceiling, 1,188.2 req/h, 2.94 h.
+                # One variable, and the baseline is measured rather than assumed.
+                #
+                #   0.8 / 0.2   band 0.60 to 0.80, mean 0.70,  2,429,804 tok/node
+                #   0.95 / 0.05 band 0.90 to 0.95, mean 0.925, 3,210,812 tok/node
+                #
+                # +32% usable L1 for no memory, and it cannot trip the
+                # --gpu-memory-utilization startup gate because the reservation
+                # is unchanged. Headroom falls from 10.31 GB to 2.58 GB, about
+                # 82 chunks, so the evictor has to react faster.
+                #
+                # Whichever setting wins, arm B must then match it.
+                - name: EVICTION_RATIO
+                  value: "0.05"
+                - name: EVICTION_WATERMARK
+                  value: "0.95"
+                - name: P2P_PORT
+                  value: "9450"
+                # Dual rail requires deploy/rdma-devices-dual-rail.yaml first.
+                # The two resources grant rocep1s0f1 and roceP2p1s0f1; UCX can
+                # then split large NIXL transfers across both ConnectX-7 links.
+                # Unset, UCX chooses by its own heuristics and can take the LAN.
+                - name: UCX_NET_DEVICES
+                  value: rocep1s0f1:1,roceP2p1s0f1:1
+                - name: UCX_MAX_RNDV_RAILS
+                  value: "2"
+                - name: UCX_CM_USE_ALL_DEVICES
+                  value: "y"
+                - name: HF_HOME
+                  value: /hf-cache
+                # Offline on the worker only. Without it a hub lookup could
+                # revalidate and start pulling 19 GB. The frontend has no such
+                # variable, because fetching the small files is its whole job.
+                - name: HF_HUB_OFFLINE
+                  value: "1"
+                - name: VLLM_OMNI_USE_QUACK_FP8
+                  value: "0"
+                - name: PYTHONHASHSEED
+                  value: "42"
+              securityContext:
+                capabilities:
+                  add: [IPC_LOCK, SYS_RESOURCE]
+                runAsUser: 0
+              resources:
+                # Both RDMA resources are required for dual rail. They are
+                # shares, not slices; each maps to one cabled ConnectX-7 port.
+                limits:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                requests:
+                  nvidia.com/gpu: "1"
+                  rdma/rdma_shared_device_a: "1"
+                  rdma/rdma_shared_device_b: "1"
+                  memory: 24Gi
+              volumeMounts:
+                # Writable: huggingface_hub creates lock files under the cache
+                # even when it resolves everything offline.
+                - { name: hf-cache, mountPath: /hf-cache }
+                - { name: entrypoint, mountPath: /entrypoint }
+                - { name: dshm, mountPath: /dev/shm }
+              startupProbe:
+                httpGet: { path: /live, port: 9090 }
+                periodSeconds: 30
+                failureThreshold: 40
